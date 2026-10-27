@@ -61,7 +61,9 @@ $HUNT destroy runs/<stack> [--retain]                          # when done
 $HUNT selftest                                                 # ranking and prune-safety checks
 ```
 
-In partition mode, candidate index `i` uses group `i // 7` and partition `i % 7 + 1`. Every `round` adds exactly
+In partition mode, candidates without `placement_override` use group `i // 7` and partition `i % 7 + 1`
+for index `i`. For any candidate, use the report's `Placement group` column (`... pN`) for actual placement;
+overrides are also in `config.json`. A `round` without `--into` adds exactly
 7 candidates per surviving AZ, one per partition in a new group; it also tests the incumbent from its older group.
 The inline CloudFormation template must hold both groups, so preflight checks the next round after `--keep 1`
 overall (about 8 KB per group in the winner's AZ). With the current template, 3 AZs × 7 initial candidates fit;

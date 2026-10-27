@@ -9,8 +9,10 @@ Two instances of the same type in the same AZ can have different latency to an e
 to the physical placement (host, rack, network path). Hunting = launch many, measure, keep the fastest.
 
 The default is **partition placement**: a partition placement group (PPG) has 7 partitions whose rack sets
-never overlap. Candidate index `i` uses group `i // 7` and partition `i % 7 + 1`. Every further round creates
-a fresh PPG per AZ and tests its 7 new candidates together with the incumbent from an older PPG. The winning **instance itself** is the deliverable:
+never overlap. Without a `placement_override`, candidate index `i` uses group `i // 7` and partition `i % 7 + 1`.
+Use the report's `Placement group` column (`... pN`) for any candidate's actual placement; overridden candidates
+also record it in `config.json`. Each round without `--into` creates a fresh PPG per AZ and tests its 7 new
+candidates together with the incumbent from an older PPG. The winning **instance itself** is the deliverable:
 keep it running and reboot only, because stop/start can move it to another host. Another instance in the same
 partition is not promised the same latency; re-measure it. `--placement cluster` instead gives every candidate its own
 CPG; in that mode production instances can later join the winning CPG in the same network segment.
@@ -116,8 +118,10 @@ in one tier are averaged as ratios to their best. `max_us` is a hard limit; `met
   never share a core; offered in all Tokyo AZs). In cluster mode, ask which type production will use and prefer the same
   family: mixing types in a CPG raises the odds of capacity errors when production joins it later. T family is rejected
   in cluster mode (no CPG support).
-- **Candidates per AZ**: default 7, one per partition in the initial PPG. Above 7, candidate index `i`
-  uses PPG `i // 7` and partition `i % 7 + 1`. In partition mode, preflight sizes both the initial template and
+- **Candidates per AZ**: default 7, one per partition in the initial PPG. Without `placement_override`, candidate
+  index `i` uses PPG `i // 7` and partition `i % 7 + 1`; use the report's `Placement group` column (`... pN`)
+  for actual placement (or `placement_override` in `config.json` for overridden candidates). In partition mode,
+  preflight sizes both the initial template and
   the next round after `--keep 1` overall (one old PPG and one new PPG in the winner's AZ). With the current inline
   51,200-byte limit, 3 AZs × 7 initial candidates fit, while 4 AZs × 6 need a maximum of 5 per AZ. If keeping a
   winner in every AZ would make the next round too large, preflight warns to keep 1 overall or split AZs into
@@ -226,8 +230,9 @@ configurable count and survivor flow. Tell the user the round number and who sur
 ranked in every round (the earlier `results/` dirs).
 
 To test within an existing partition instead, use `$HUNT round runs/<stack> <count> --into <az-id>:<ppg-group-index>:<partition>`
-with 1–20 challengers; for example, `--into apne1-az4:3:4` targets group 3, partition 4 in that AZ (the group
-of candidate `apne1-az4-24` is `24 // 7 = 3`). The AZ and group must still exist in the stack. This reuses its
+with 1–20 challengers; for example, `--into apne1-az4:3:4` targets group 3, partition 4 in that AZ.
+Choose the placement from the report's `Placement group` column (`... pN`), or `placement_override` in `config.json`
+for an overridden candidate. In the group name, `G<N>` means group N and no `G` suffix means group 0. The AZ and group must have a running candidate. This reuses its
 PPG and adds instances only (or a launch template for that partition if needed). Instances in the same partition
 share racks, so comparing the challengers with the incumbent measures within-partition latency variance.
 

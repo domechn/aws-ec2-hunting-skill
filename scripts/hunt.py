@@ -683,7 +683,7 @@ def env_section(rows, env, meta, n_cands):
            "TLS and WS upgrade are timed on the first connection of each IP.",
            "- **Network path**: instance public IPv4 -> Internet Gateway -> exchange public IP. No NAT gateway, VPN, PrivateLink, "
            "peering or Transit Gateway unless the run was given `--route`. Security group: egress only.",
-           f"- **Placement and window**: cluster mode gives each candidate its own placement group; partition mode assigns candidate index i to group i // 7 and partition i % 7 + 1. Each further round gets a fresh group per AZ. "
+           f"- **Placement and window**: cluster mode gives each candidate its own placement group; in partition mode, candidate index i maps to group i // 7 and partition i % 7 + 1 only without a placement_override. The Placement group column (group name and pN) gives actual placement; overridden candidates also record it in config.json. Each round without --into gets a new group per AZ. "
            f"{n_cands} candidates probed at the same moment for {secs} s. Exchange hostnames are resolved on each instance at start, "
            "so the IP sets can differ between instances.", ""]
     if env:
@@ -1002,11 +1002,6 @@ def next_round(run, per_az, into=None):
             sys.exit(f"--into needs a nonnegative group and partition 1..{PARTITIONS}")
         if az not in cfg["az_subnets"]:
             sys.exit(f"--into AZ {az} has no subnet in this stack")
-        existing = cfg["keep"] + cfg.get("new", []) if cfg["keep"] else [
-            f"{az}-{i}" for i in range(cfg["instances_per_az"])]
-        if not any(key.startswith(f"{az}-") and configured_placement(cfg, key)["group"] == group
-                   for key in existing):
-            sys.exit(f"--into placement group {az}:{group} does not exist in the config")
     elif placement == "partition" and per_az != PARTITIONS:
         sys.exit(f"partition rounds require exactly {PARTITIONS} challengers per AZ (one fresh placement group)")
     stack = cfg["stack"]
@@ -1015,6 +1010,13 @@ def next_round(run, per_az, into=None):
         sys.exit("no running candidates: nothing to extend")
     if into is not None and az not in {c["az_id"] for c in cands.values()}:
         sys.exit(f"--into AZ {az} has no running candidate")
+    if into is not None:
+        running = [configured_placement(cfg, key) for key, cand in cands.items() if cand["az_id"] == az]
+        if group not in {p["group"] for p in running}:
+            available = ", ".join(f"{az}:{g} p{p}" for g, p in sorted({
+                (p["group"], p["partition"]) for p in running}))
+            sys.exit(f"--into placement group {az}:{group} has no running candidate; "
+                     f"running placements in {az}: {available}")
     nxt = cfg.setdefault("next_index", {az: cfg["instances_per_az"] for az in cfg["az_subnets"]})
     cfg["keep"] = list(cands)  # whatever runs now are the incumbents
     cfg["az_subnets"] = {az: cidr for az, cidr in cfg["az_subnets"].items() if az in {c["az_id"] for c in cands.values()}}
@@ -1202,15 +1204,20 @@ def selftest():
     assert unsafe_round_changes([replacing], "partition", into=("az1", 0, 4))
     parser = make_parser()
     assert parser.parse_args(["round", "runs/example", "20", "--into", "apne1-az4:3:4"]).into == ("apne1-az4", 3, 4)
+    assert parse_into("apne1-az4:2147483647:7") == ("apne1-az4", 2_147_483_647, 7)
     for bad_args in (["round", "runs/example", "1", "--into", "apne1-az4:3"],
                      ["round", "runs/example", "1", "--into", "apne1-az4:x:4"],
+                     ["round", "runs/example", "1", "--into", "apne1-az4:03:4"],
+                     ["round", "runs/example", "1", "--into", "apne1-az4:3:04"],
+                     ["round", "runs/example", "1", "--into", "apne1-az4:2147483648:4"],
+                     ["round", "runs/example", "1", "--into", f"apne1-az4:{'9' * 1000}:4"],
                      ["round", "runs/example", "1", "--into", "apne1-az4:3:0"],
                      ["round", "runs/example", "1", "--into", "apne1-az4:3:8"]):
-        with patch.object(sys, "stderr", io.StringIO()):
+        with patch.object(sys, "stderr", io.StringIO()) as stderr:
             try:
                 parser.parse_args(bad_args)
             except SystemExit as e:
-                assert e.code == 2
+                assert e.code == 2 and "--into must be AZ_ID:GROUP:PARTITION" in stderr.getvalue()
             else:
                 assert False, f"accepted {bad_args}"
     assert pg({"cpg": "group", "partition": 4}) == "group p4"
@@ -1297,11 +1304,34 @@ def selftest():
             assert all(staged[-1]["placement_override"][key] == {"group": 3, "partition": 4}
                        for key in ("az1-25", "az1-26"))
             assert json.loads(config.read_text()) == group3_cfg
+            stale_cfg = {**json.loads(original), "keep": ["az1-0", "az1-7"],
+                         "next_index": {"az1": 8}}
+            config.write_text(json.dumps(stale_cfg))
+            before = len(staged)
+            try:
+                next_round(tmp, 1, into=("az1", 1, 1))
+            except SystemExit as e:
+                assert "az1:1" in str(e) and "az1:0 p1" in str(e), str(e)
+            else:
+                assert False, "accepted a group with no running instance"
+            assert len(staged) == before and json.loads(config.read_text()) == stale_cfg
+            overridden_cfg = {**json.loads(original), "keep": ["az1-7"],
+                              "next_index": {"az1": 8},
+                              "placement_override": {"az1-7": {"group": 0, "partition": 4}}}
+            config.write_text(json.dumps(overridden_cfg))
+            with patch.dict(globals(), {"candidates": lambda stack: {
+                    "az1-7": dict(test_cands["az1-0"], instance_id="i-7", partition=4)}}):
+                try:
+                    next_round(tmp, 1, into=("az1", 0, 4))
+                except SystemExit as e:
+                    assert "refusing to extend" in str(e), str(e)
+            assert staged[-1]["new"] == ["az1-8"]
+            assert json.loads(config.read_text()) == overridden_cfg
             config.write_text(original)
             for count, target, reason in ((0, ("az1", 0, 4), "1..20"),
                                           (21, ("az1", 0, 4), "1..20"),
                                           (1, ("az9", 0, 4), "subnet"),
-                                          (1, ("az1", 1, 4), "does not exist")):
+                                          (1, ("az1", 1, 4), "no running candidate")):
                 try:
                     next_round(tmp, count, into=target)
                 except SystemExit as e:
@@ -1487,9 +1517,9 @@ def selftest():
 
 
 def parse_into(value):
-    match = re.fullmatch(r"([^:]+):([0-9]+):([1-7])", value)
-    if not match:
-        raise argparse.ArgumentTypeError("--into must be AZ_ID:GROUP:PARTITION (group >= 0, partition 1..7)")
+    match = re.fullmatch(r"([^:]+):(0|[1-9][0-9]{0,9}):([1-7])", value)
+    if not match or int(match.group(2)) > 2_147_483_647:
+        raise argparse.ArgumentTypeError("--into must be AZ_ID:GROUP:PARTITION (group 0..2147483647, partition 1..7)")
     return match.group(1), int(match.group(2)), int(match.group(3))
 
 
