@@ -122,7 +122,7 @@ in one tier are averaged as ratios to their best. `max_us` is a hard limit; `met
   51,200-byte limit, 3 AZs × 7 initial candidates fit, while 4 AZs × 6 need a maximum of 5 per AZ. If keeping a
   winner in every AZ would make the next round too large, preflight warns to keep 1 overall or split AZs into
   separate runs. In cluster mode, preflight checks the initial template size.
-- **Duration**: default 300 s, never less than 300 (`hunt.py` refuses).
+- **Duration**: default 300 s. `hunt.py` refuses anything under `MIN_SECS`, which is 60 s unless the env var `HUNT_MIN_SECS` says otherwise (`HUNT_MIN_SECS=300` enforces the recommended minimum). 60 s gives only ~115 TCP-handshake samples per IP, so rankings are noisier.
 - **AMI**: ask with AskUserQuestion, options: "default: latest Amazon Linux 2023 (Recommended)" (SSM agent built in, chrony on
   Amazon Time Sync) or their own, entered as Other: an AMI id (`ami-...`, must be visible in the region and match the
   instance architecture) or an SSM public parameter path (e.g. Ubuntu: `/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id`).
