@@ -1,6 +1,6 @@
 ---
 name: aws-ec2-hunting
-description: One-click EC2 hunting for low-latency crypto trading. Launches test EC2 instances in the AZ IDs the user picks (each in its own cluster placement group), measures WebSocket RTT from every instance to every IP of every exchange endpoint (Binance, OKX, Bybit, Bitget, Gate, Hyperliquid, or an exchange-provided dedicated endpoint) for at least 5 minutes, ranks them against the user's goal (e.g. order leg first, market-data leg second), reports TCP/TLS/WebSocket-upgrade/RTT breakdowns, live market-data lag and the fastest endpoint IP per instance, then keeps the winners and terminates the rest, optionally over several elimination rounds. Use this whenever someone wants to find the fastest AWS placement, AZ or instance for an exchange, compare AZ latency to an exchange, pick a cluster placement group for a trading host, or mentions EC2 hunting, exchange latency testing, tick-to-trade network optimization, or market-making / HFT placement, in any language, even without the word "hunting".
+description: One-click EC2 hunting for low-latency crypto trading. Launches test EC2 instances in the AZ IDs the user picks (by default across 7 partitions per AZ, or each in its own cluster placement group), measures WebSocket RTT from every instance to every IP of every exchange endpoint (Binance, OKX, Bybit, Bitget, Gate, Hyperliquid, or an exchange-provided dedicated endpoint) for at least 5 minutes, ranks them against the user's goal (e.g. order leg first, market-data leg second), reports TCP/TLS/WebSocket-upgrade/RTT breakdowns, live market-data lag and the fastest endpoint IP per instance, then keeps the winners and terminates the rest, optionally over several elimination rounds. Use this whenever someone wants to find the fastest AWS placement, AZ or instance for an exchange, compare AZ latency to an exchange, pick a cluster placement group for a trading host, or mentions EC2 hunting, exchange latency testing, tick-to-trade network optimization, or market-making / HFT placement, in any language, even without the word "hunting".
 ---
 
 # EC2 Hunting
@@ -8,10 +8,12 @@ description: One-click EC2 hunting for low-latency crypto trading. Launches test
 Two instances of the same type in the same AZ can have different latency to an exchange, because latency belongs
 to the physical placement (host, rack, network path). Hunting = launch many, measure, keep the fastest.
 
-This skill only ever launches **test instances**. Each candidate gets **its own cluster placement group (CPG)**.
-What the user takes away is the winner's CPG: production instances launched into it later land in the same
-network segment. A PPG cannot give that: a running instance can't join a CPG without a stop/start, and stop/start
-moves it to another host, which throws the measured placement away. Use this to explain the design if asked.
+The default is **partition placement**: one partition placement group (PPG) per AZ, with 7 partitions whose rack sets
+never overlap. At 7 candidates per AZ, every candidate tests a distinct rack set. Candidate index `i` uses partition
+`i % 7 + 1`; more than 7 candidates per AZ share partitions. The winning **instance itself** is the deliverable:
+keep it running and reboot only, because stop/start can move it to another host. Another instance in the same
+partition is not promised the same latency; re-measure it. `--placement cluster` instead gives every candidate its own
+CPG; in that mode production instances can later join the winning CPG in the same network segment.
 
 ## Conventions
 
@@ -111,10 +113,13 @@ in one tier are averaged as ratios to their best. `max_us` is a hard limit; `met
 ### 5. Instance parameters
 
 - **Instance type**: default `m8azn.large` (2 vCPU = 2 full cores, no hyper-threads, so the RTT probe on CPU 1 and the feed on CPU 0
-  never share a core; cluster placement groups supported, offered in all Tokyo AZs). Ask which type production will use, and prefer the same family: mixing types in a
-  CPG raises the odds of capacity errors when production joins it later. T family is rejected (no CPG support).
-- **Candidates per AZ**: default 7. The whole run must stay at or under about 33 candidates (CloudFormation inline template
-  limit, which is what lets us skip `cdk bootstrap`). Split more into separate runs.
+  never share a core; offered in all Tokyo AZs). In cluster mode, ask which type production will use and prefer the same
+  family: mixing types in a CPG raises the odds of capacity errors when production joins it later. T family is rejected
+  in cluster mode (no CPG support).
+- **Candidates per AZ**: default 7, the sweet spot for testing distinct partitions. Above 7, candidates share partitions
+  (`i % 7 + 1`). In partition mode, the inline CloudFormation template fits about 10 per AZ across 3 AZs, or 5 per AZ
+  across 4 AZs; 5 or more AZs have little room. Preflight checks the actual template and reports the maximum per AZ that
+  fits. Split larger hunts into separate runs.
 - **Duration**: default 300 s, never less than 300 (`hunt.py` refuses).
 - **AMI**: ask with AskUserQuestion, options: "default: latest Amazon Linux 2023 (Recommended)" (SSM agent built in, chrony on
   Amazon Time Sync) or their own, entered as Other: an AMI id (`ami-...`, must be visible in the region and match the
@@ -127,7 +132,8 @@ in one tier are averaged as ratios to their best. `max_us` is a hard limit; `met
 ### 6. VPC and preflight
 
 1. `aws ec2 describe-vpcs --query 'Vpcs[].[VpcId,CidrBlock,IsDefault,Tags[?Key==\`Name\`]|[0].Value]' --output table`, ask which VPC.
-2. `$HUNT preflight <vpc-id> <type> <per-az> <az-id>... [--secs N] [--ami ...] [--route CIDR=pcx-...]`. It checks:
+2. `$HUNT preflight <vpc-id> <type> <per-az> <az-id>... [--placement partition|cluster] [--secs N] [--ami ...] [--route CIDR=pcx-...]`.
+   Partition is the default. It checks:
    VPC DNS, the IGW (reused if attached, never modified), IGW ingress routing (appliance on the return path),
    the default NACL, free /27 per AZ, instance type offered per AZ, vCPU quota, the AMI (arch, state), a RunInstances dry run (catches SCPs), and price.
    It then creates `runs/<stack>/config.json`.
@@ -141,8 +147,10 @@ charges. Explain this if the user asks why their existing (NAT) subnets aren't u
 
 One AskUserQuestion (options: start / change parameters / cancel) whose text covers:
 
-- What gets created in which VPC: N x `<type>` (one CPG each), one /27 subnet per AZ, a route table, a security group
-  (egress only), an IAM role + instance profile (SSM only), and an IGW only if the VPC has none. Nothing existing is modified.
+- What gets created in which VPC: N x `<type>`, one /27 subnet per AZ, a route table, a security group
+  (egress only), an IAM role + instance profile (SSM only), and an IGW only if the VPC has none. Partition mode adds
+  one PPG and 7 launch templates per AZ; cluster mode adds one CPG per candidate and one launch template.
+  Nothing existing is modified.
 - Cost: `estimated_run_usd` from preflight (instances + public IPv4, about `hours` hours), or "see On-Demand pricing" if the lookup failed.
 - Timeline: about 5-8 min deploy + build, 1 min smoke, then the test duration, then the report.
 - **After the test, candidates that don't meet the goal are terminated automatically**; the top `keep` stay running and
@@ -154,7 +162,8 @@ Only continue on an explicit "start".
 ### 8. Deploy
 
 `$HUNT deploy runs/<stack>` (background). It synthesizes the CDK app, checks the template size and deploys with the caller's
-credentials. No `cdk bootstrap` and no S3: the probe source ships gzipped in the launch template's user data. It prints the
+credentials. No `cdk bootstrap` and no S3: partition mode bootstraps the toolchain via user data; `hunt.py run` syncs
+and builds the probe over SSM. Cluster mode also ships the probe source in user data. It prints the
 candidates. If some fail with `InsufficientInstanceCapacity`, AWS had no capacity right then (not a quota issue):
 `$HUNT destroy runs/<stack>` and retry, or use fewer candidates in that AZ.
 
@@ -196,14 +205,16 @@ Then add 2-4 observations, e.g.:
 ### 12. Recycle the losers (automatic, already confirmed in step 7)
 
 `$HUNT prune <results-dir>`. It rebuilds the stack with only the kept candidates and creates a CloudFormation change set.
-It executes the change set only if every change is a removal of a losing instance, its CPG, or the subnet of an AZ with no
-winner left; anything else aborts with the offending changes listed, and then you ask the user. With nothing kept it deletes
+It executes the change set only if every change removes a losing instance or its CPG (cluster mode), or the PPG,
+7 launch templates, and subnet of an AZ with no winner left (partition mode). The shared PPG and launch templates
+stay while that AZ has a winner. Any other change aborts with the offending changes listed. With nothing kept it deletes
 the whole stack. Report what was kept, what was terminated, and the ongoing hourly cost.
 
 ### 12b. More rounds (when the user asked for them)
 
 Each further round: `$HUNT round runs/<stack> <challengers-per-az>` adds fresh candidates in the AZs that still have a winner
-(CloudFormation change set; it refuses anything but added instances and CPGs, so the winners are never touched), then repeat
+(CloudFormation change set; partition mode allows only added instances, cluster mode also allows added CPGs, so the winners
+are never touched). Partition challengers use partitions without a winner first. Then repeat
 steps 10-12 with `report --keep <survivors this round>`. Tell the user the round number and who survived after each one.
 The last round's survivors are the final winners; show how they ranked in every round (the earlier `results/` dirs).
 
@@ -211,14 +222,18 @@ The last round's survivors are the final winners; show how they ranked in every 
 
 Tell the user (the skill itself never launches production):
 
-- Keep the winner running: it anchors the CPG. Reboot only. stop/start or changing the instance type moves it to another host.
-- Launch production into the winning CPG from **their own subnet in the same AZ** (the CPG is a regional resource, so any VPC
-  works): `aws ec2 run-instances --placement GroupName=<cpg> --subnet-id <their-subnet> --instance-type <type> ...`.
-  Launch all of them in one request to reduce capacity errors. Don't use the hunting subnet: deleting the run removes its route table.
-- Re-test new production instances with the same targets. Same network segment, but different hosts.
-- Once production is verified, `$HUNT destroy runs/<stack> --retain` deletes the test winner and everything else, but leaves
-  any CPG that production instances use. Without production in the CPG, `$HUNT destroy runs/<stack>` removes everything.
-  Always confirm before destroying.
+- **Partition mode:** the winning instance is the production host. Keep the run and that instance while using it; reboot
+  only with `sudo reboot`. An OS-level shutdown, halt, or poweroff terminates the instance and its root volume. Never
+  stop/start or change its instance type: that can move it and lose the measured placement. Do not assume
+  another instance in the same partition is as fast; re-measure any replacement with the same targets.
+- **Cluster mode:** keep the winner running while launching production into the winning CPG from **their own subnet in
+  the same AZ** (the CPG is a regional resource, so any VPC works):
+  `aws ec2 run-instances --placement GroupName=<cpg> --subnet-id <their-subnet> --instance-type <type> ...`.
+  Launch all of them in one request to reduce capacity errors. Don't use the hunting subnet: deleting the run removes
+  its route table. Re-test new production instances with the same targets; they use different hosts.
+- When finished with the winner, `$HUNT destroy runs/<stack>` removes the run and its instance.
+  `$HUNT destroy runs/<stack> --retain` can leave a placement group used by instances outside the hunt, including
+  a shared PPG; it still deletes the winning instance. Always confirm before destroying.
 - Placement is only "best for now": re-hunt periodically. `$HUNT list` shows the hunting stacks in a region.
 
 ## FAQ
@@ -234,7 +249,8 @@ Tell the user (the skill itself never launches production):
 ## Troubleshooting
 
 - SSM never online: VPC DNS support, or the hunting route table not pointing to the IGW.
-- Build failed: `hunt.py` prints the tail of `/var/log/cloud-init-output.log` (usually no access to crates.io / rustup).
+- Build failed: in partition mode, check the "probe sync" SSM output for cargo's last 5 lines. For cloud-init failures,
+  `hunt.py` prints the tail of `/var/log/cloud-init-output.log` (usually no access to crates.io / rustup).
 - A target stays at 0 samples: `/var/log/hunt.log` on the instance (`aws ssm start-session --target <id>`). Usual causes are a
   wrong URL/port/match, geo-blocking, a missing allowlist, or a missing private route.
 - Results truncated: SSM returns 24,000 characters, about 100 rows (instances x exchange IPs). Split targets across runs.

@@ -4,7 +4,7 @@
 A run is one CloudFormation stack (synthesized by infra/app.py) plus a local directory runs/<stack>/.
 
   hunt.py perms                                       can this identity run the whole flow?
-  hunt.py preflight VPC TYPE PER_AZ AZ_ID... [--secs N] [--ami ami-xxx|/ssm/param] [--route CIDR=pcx-|tgw-id]...
+  hunt.py preflight VPC TYPE PER_AZ AZ_ID... [--placement partition|cluster] [--secs N] [--ami ami-xxx|/ssm/param] [--route CIDR=pcx-|tgw-id]...
                                                       network/capacity/quota/price checks, creates runs/<stack>/
   hunt.py deploy RUN                                  synth + deploy the stack (no cdk bootstrap needed)
   hunt.py run RUN TARGETS SECS [--smoke]              probe every candidate at the same moment, save results
@@ -26,8 +26,10 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS = ROOT / "runs"
@@ -38,12 +40,13 @@ MIN_SECS = 300
 SMOKE_SECS = 30
 SSM_STDOUT_LIMIT = 24000  # get-command-invocation truncates StandardOutputContent here
 TEMPLATE_LIMIT = 51200  # inline template body limit; above it CDK would need a bootstrap bucket
+PARTITIONS = 7
 IPV4_USD_PER_HOUR = 0.005  # public IPv4 address charge
 AMI_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-{arch}"
 
 REQUIRED_ACTIONS = [f"cloudformation:{a}" for a in (
     "CreateChangeSet DescribeChangeSet ExecuteChangeSet DeleteChangeSet DescribeStacks DescribeStackEvents "
-    "GetTemplate DeleteStack").split()] + [f"ec2:{a}" for a in (
+    "GetTemplate DescribeStackResources DeleteStack").split()] + [f"ec2:{a}" for a in (
     "DescribeAvailabilityZones DescribeVpcs DescribeVpcAttribute DescribeSubnets DescribeRouteTables "
     "DescribeInternetGateways DescribeNetworkAcls DescribeSecurityGroups DescribePlacementGroups DescribeInstances "
     "DescribeInstanceTypes DescribeImages DescribeNetworkInterfaces DescribeInstanceTypeOfferings DescribeLaunchTemplates DescribeLaunchTemplateVersions "
@@ -58,7 +61,7 @@ REQUIRED_ACTIONS = [f"cloudformation:{a}" for a in (
                          "DescribeInstanceInformation".split()]
 OPTIONAL_ACTIONS = ["servicequotas:GetServiceQuota", "pricing:GetProducts"]
 # What prune is allowed to remove (anything else in the change set aborts it).
-PRUNABLE = {"AWS::EC2::Instance", "AWS::EC2::PlacementGroup", "AWS::EC2::Subnet", "AWS::EC2::SubnetRouteTableAssociation"}
+PRUNABLE = {"AWS::EC2::Instance", "AWS::EC2::PlacementGroup", "AWS::EC2::LaunchTemplate", "AWS::EC2::Subnet", "AWS::EC2::SubnetRouteTableAssociation"}
 
 
 def log(msg):
@@ -73,7 +76,7 @@ def aws(*args):
     out = sh("aws", *args, "--output", "json")
     return json.loads(out) if out.strip() else None
 
-
+    return (getattr(e, "stderr", None) or str(e)).strip().splitlines()[-1]
 def err_line(e):
     return (e.stderr or str(e)).strip().splitlines()[-1]
 
@@ -94,7 +97,8 @@ def candidates(stack):
     for i in found:
         key = next(t["Value"] for t in i["Tags"] if t["Key"] == "hunt:key")
         out[key] = {"instance_id": i["InstanceId"], "public_ip": i.get("PublicIpAddress"), "az_id": key.rsplit("-", 1)[0],
-                    "cpg": i["Placement"].get("GroupName"), "subnet_id": i["SubnetId"]}
+                    "placement_group": i["Placement"].get("GroupName"), "partition": i["Placement"].get("PartitionNumber"),
+                    "subnet_id": i["SubnetId"]}
     return dict(sorted(out.items()))
 
 
@@ -164,7 +168,7 @@ def on_demand_price(itype, region):
     return float(next(iter(term["priceDimensions"].values()))["pricePerUnit"]["USD"])
 
 
-def preflight(vpc_id, itype, per_az, az_ids, secs, routes, ami_spec=None):
+def preflight(vpc_id, itype, per_az, az_ids, secs, routes, ami_spec=None, placement="partition"):
     region = os.environ["AWS_REGION"]
     checks = []  # (level, message)
     add = lambda level, msg: checks.append((level, msg))
@@ -220,8 +224,10 @@ def preflight(vpc_id, itype, per_az, az_ids, secs, routes, ami_spec=None):
         add("FAIL", f"{itype} is not offered in {missing}")
     else:
         add("OK", f"{itype} is offered in every chosen AZ")
-    if itype.startswith("t") and itype[1].isdigit():
+    if placement == "cluster" and itype.startswith("t") and itype[1].isdigit():
         add("FAIL", "T family instances can't join a cluster placement group")
+    if placement == "partition":
+        add("OK", "partition placement group per AZ, 7 partitions (rack sets that never overlap); candidate i -> partition i%7+1")
 
     count = per_az * len(az_ids)
     need = info["VCpuInfo"]["DefaultVCpus"] * count
@@ -274,31 +280,76 @@ def preflight(vpc_id, itype, per_az, az_ids, secs, routes, ami_spec=None):
     except (subprocess.CalledProcessError, IndexError, KeyError) as e:
         cost = {"error": f"price lookup failed: {e}", "hours": round(hours, 2)}
 
+    stack = STACK_PREFIX + time.strftime("%Y%m%d-%H%M%S")
+    cfg = {"stack": stack, "region": region, "vpc_id": vpc_id, "igw_id": igw_id, "az_subnets": az_subnets,
+           "instance_type": itype, "instances_per_az": per_az, "ami": ami, "extra_routes": routes, "keep": [],
+           "placement": placement}
+    if az_subnets:
+        try:
+            size, maximum = template_size_and_max(cfg)
+            if size <= TEMPLATE_LIMIT:
+                add("OK", f"template {size} bytes (inline limit {TEMPLATE_LIMIT})")
+            else:
+                add("FAIL", f"template {size} bytes exceeds the {TEMPLATE_LIMIT}-byte inline limit; "
+                    f"max candidates per AZ that fit: {maximum if maximum is not None else 'none'}")
+        except (subprocess.CalledProcessError, OSError) as e:
+            add("FAIL", f"could not synthesize template: {err_line(e)}")
+
     for level, msg in checks:
         print(f"{level:5} {msg}")
     print("COST  " + json.dumps(cost))
     if any(level == "FAIL" for level, _ in checks):
         print("No run created: fix the FAIL items first.")
         return 1
-    stack = STACK_PREFIX + time.strftime("%Y%m%d-%H%M%S")
     run = RUNS / stack
     run.mkdir(parents=True)
-    (run / "config.json").write_text(json.dumps({
-        "stack": stack, "region": region, "vpc_id": vpc_id, "igw_id": igw_id, "az_subnets": az_subnets,
-        "instance_type": itype, "instances_per_az": per_az, "ami": ami, "extra_routes": routes, "keep": []}, indent=2) + "\n")
+    (run / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     print(f"RUN   {run}  ({count} x {itype}, AMI {ami})")
     return 0
 
 
 # ---------------------------------------------------------------- deploy / destroy
 
-def cdk(*args):
+def ensure_cdk_venv():
     if not (VENV / "bin" / "python").exists():
         log("creating infra/.venv with aws-cdk-lib (first run only)")
         sh(sys.executable, "-m", "venv", str(VENV))
         sh(str(VENV / "bin" / "pip"), "install", "-q", "-r", str(ROOT / "infra" / "requirements.txt"))
+
+
+def offline_template_size(cfg):
+    ensure_cdk_venv()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        config = tmp / "config.json"
+        config.write_text(json.dumps(cfg))
+        out = tmp / "cdk.out"
+        env = {**os.environ, "JSII_RUNTIME_PACKAGE_CACHE": "disabled",
+               "CDK_CONTEXT_JSON": json.dumps({"config": str(config), "aws:cdk:enable-path-metadata": True}),
+               "CDK_OUTDIR": str(out)}
+        subprocess.run([str(VENV / "bin" / "python"), str(ROOT / "infra" / "app.py")], check=True, cwd=tmp,
+                       env=env, capture_output=True, text=True)
+        return (out / f"{cfg['stack']}.template.json").stat().st_size
+
+
+def template_size_and_max(cfg):
+    size = offline_template_size(cfg)
+    if size <= TEMPLATE_LIMIT:
+        return size, None
+    low, high = 0, cfg["instances_per_az"] - 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        if offline_template_size({**cfg, "instances_per_az": middle}) <= TEMPLATE_LIMIT:
+            low = middle
+        else:
+            high = middle - 1
+    return size, low if low or offline_template_size({**cfg, "instances_per_az": 0}) <= TEMPLATE_LIMIT else None
+
+
+def cdk(*args):
+    ensure_cdk_venv()
     subprocess.run(["npx", "--yes", "aws-cdk@2", *args, "--no-notices"], check=True, cwd=ROOT,
-                   env={**os.environ, "CDK_DISABLE_CLI_TELEMETRY": "true"})
+                   env={**os.environ, "CDK_DISABLE_CLI_TELEMETRY": "true", "JSII_RUNTIME_PACKAGE_CACHE": "disabled"})
 
 
 def pin_user_data(run, cfg, template):
@@ -323,7 +374,7 @@ def synth(run):
     size = len(template.read_bytes())
     if size > TEMPLATE_LIMIT:
         sys.exit(f"template is {size} bytes, over the {TEMPLATE_LIMIT}-byte inline limit: "
-                 "use fewer candidates (about 33 max) or split the AZs into separate runs")
+                 "use fewer candidates per AZ or split the AZs into separate runs")
     return cfg, template
 
 
@@ -350,8 +401,8 @@ def destroy(run, retain=False):
     if in_subnets:
         sys.exit("refusing to delete: these instances aren't part of the hunt but sit in its subnets, and deleting "
                  "the stack removes their route table: " + ", ".join(i["InstanceId"] for i in in_subnets))
-    cpgs = phys("AWS::EC2::PlacementGroup")
-    in_use = {i["Placement"]["GroupName"] for i in foreign_instances(stack, "placement-group-name", list(cpgs))}
+    groups = phys("AWS::EC2::PlacementGroup")
+    in_use = {i["Placement"]["GroupName"] for i in foreign_instances(stack, "placement-group-name", list(groups))}
     if in_use and not retain:
         sys.exit(f"placement groups {sorted(in_use)} hold instances outside the hunt (production?). Rerun with "
                  "--retain to delete everything else and leave those groups in the account.")
@@ -363,7 +414,7 @@ def destroy(run, retain=False):
         if not in_use:
             raise
         # CloudFormation only accepts --retain-resources once the first delete has failed on them.
-        aws("cloudformation", "delete-stack", "--stack-name", stack, "--retain-resources", *(cpgs[g] for g in in_use))
+        aws("cloudformation", "delete-stack", "--stack-name", stack, "--retain-resources", *(groups[g] for g in in_use))
         sh("aws", "cloudformation", "wait", "stack-delete-complete", "--stack-name", stack)
         print(f"kept placement groups {sorted(in_use)} outside any stack")
     print(f"{stack} deleted")
@@ -375,7 +426,7 @@ def list_runs():
         if s["StackName"].startswith(STACK_PREFIX):
             cands = candidates(s["StackName"])
             print(f"{s['StackName']}  {s['StackStatus']}  running candidates: "
-                  + (", ".join(f"{k} {c['instance_id']} {c['cpg']}" for k, c in cands.items()) or "none"))
+                  + (", ".join(f"{k} {c['instance_id']} {pg(c)}" for k, c in cands.items()) or "none"))
 
 
 # ---------------------------------------------------------------- run
@@ -428,14 +479,16 @@ def probe_sync_commands():
     files = {f: (ROOT / "probe" / f).read_bytes() for f in PROBE_FILES}
     digest = hashlib.sha256(b"".join(files.values())).hexdigest()
     cmds = [f"cd /opt/hunt/probe && [ \"$(cat {' '.join(PROBE_FILES)} | sha256sum | cut -d' ' -f1)\" = {digest} ] "
+            f"&& test -x {BIN} "
             "&& { echo in-sync; exit 0; }"]
     for f, data in files.items():  # chunked: SSM limits the size of each command
         b64 = base64.b64encode(gzip.compress(data, mtime=0)).decode()
         cmds += [": > /tmp/sync.b64"] + [f"echo -n '{b64[i:i + 3000]}' >> /tmp/sync.b64" for i in range(0, len(b64), 3000)]
         cmds.append(f"base64 -d /tmp/sync.b64 | gunzip > /opt/hunt/probe/{f}")
-    cmds.append("export HOME=/root RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust; "
-                "/opt/rust/bin/cargo build --release --manifest-path /opt/hunt/probe/Cargo.toml 2>&1 | tail -5; "
-                f"test -x {BIN} && echo rebuilt")
+    cmds.append("bash -o pipefail -c 'export HOME=/root RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust; "
+                f"rm -f {BIN} && /opt/rust/bin/cargo build --release --manifest-path /opt/hunt/probe/Cargo.toml 2>&1 | tail -5 "
+                "&& "
+                f"test -x {BIN} && echo rebuilt'")
     return cmds
 
 
@@ -449,7 +502,9 @@ def collect_env(ids, cands):
     for i in aws("ec2", "describe-instances", "--instance-ids", *ids, "--query", "Reservations[].Instances[]"):
         iid, cpu = i["InstanceId"], i.get("CpuOptions", {})
         ec2[iid] = {"instance_type": i["InstanceType"], "ami": i["ImageId"], "az_id": cands[byid[iid]]["az_id"],
-                    "placement": f"cluster placement group, one instance per group, tenancy {i['Placement'].get('Tenancy')}",
+                    "placement": (f"partition placement group {i['Placement'].get('GroupName')}"
+                                  if i["Placement"].get("PartitionNumber") else "cluster placement group, one instance per group")
+                                 + f", tenancy {i['Placement'].get('Tenancy')}",
                     "cpu": f"{cpu.get('CoreCount')} cores x {cpu.get('ThreadsPerCore')} threads",
                     "ena_support": i.get("EnaSupport"), "ena_express": "enabled" if srd.get(iid) else "off",
                     "ebs_optimized": i.get("EbsOptimized"), "imds_tokens": i.get("MetadataOptions", {}).get("HttpTokens"),
@@ -470,7 +525,7 @@ def run_probe(run, targets, secs, smoke):
         sys.exit("no running candidates in this run")
     wait_online(ids)
     # Wait for the build everywhere first, so the real test starts at the same moment on every instance.
-    ready = ssm(ids, [f"cloud-init status --wait >/dev/null; test -x {BIN} || "
+    ready = ssm(ids, [f"cloud-init status --wait >/dev/null; test -x {BIN} || test -x /opt/rust/bin/cargo || "
                       "{ tail -40 /var/log/cloud-init-output.log; exit 1; }"], 1800, "build")
     if not ready:
         sys.exit("no instance finished building the probe")
@@ -598,7 +653,7 @@ def env_section(rows, env, meta, n_cands):
            "TLS and WS upgrade are timed on the first connection of each IP.",
            "- **Network path**: instance public IPv4 -> Internet Gateway -> exchange public IP. No NAT gateway, VPN, PrivateLink, "
            "peering or Transit Gateway unless the run was given `--route`. Security group: egress only.",
-           f"- **Placement and window**: each candidate in its own cluster placement group, nothing else running on it but the SSM agent; "
+           f"- **Placement and window**: cluster mode gives each candidate its own placement group; partition mode uses one group per AZ and assigns candidate index i to partition i % 7 + 1 (indices above 6 reuse partitions). "
            f"{n_cands} candidates probed at the same moment for {secs} s. Exchange hostnames are resolved on each instance at start, "
            "so the IP sets can differ between instances.", ""]
     if env:
@@ -607,6 +662,12 @@ def env_section(rows, env, meta, n_cands):
     else:
         out += ["(no env.json in this result directory: it was collected by an older version)", ""]
     return out
+
+
+def pg(c):
+    """Placement group, with the partition number when it is a partition group."""
+    name = c.get("placement_group", c.get("cpg"))  # old saved results used "cpg"
+    return f"{name} p{c['partition']}" if c.get("partition") else str(name)
 
 
 def render(rows, cands, goal, env=None, meta=None):
@@ -639,7 +700,7 @@ def render(rows, cands, goal, env=None, meta=None):
         return f"{v} ({v / floor[t]:.2f}x)" if t in floor else str(v)
 
     c = lambda k: cands[k]
-    ident = lambda k: [k, c(k)["az_id"], c(k)["cpg"], c(k)["instance_id"], c(k)["public_ip"]]
+    ident = lambda k: [k, c(k)["az_id"], pg(c(k)), c(k)["instance_id"], c(k)["public_ip"]]
     out = ["# EC2 Hunting Report", "",
            "All times in us. Each instance is scored with its fastest endpoint IP (the exchange resolves to several IPs; "
            "every instance probes all of them). Columns:", "",
@@ -649,15 +710,14 @@ def render(rows, cands, goal, env=None, meta=None):
            "- **TLS**: TLS handshake after the TCP connect (network round trips plus crypto on both ends).",
            "- **WS upgrade**: HTTP upgrade request -> 101 response, one round trip plus server processing.",
            "- **Req/resp RTT p50/p95/p99**: WebSocket request sent -> full response received, once per second: network round trip "
-           "plus the exchange's processing of the request. This is the "
-           "ranking metric. It includes the exchange's own processing of the request.",
+           "plus the exchange's processing of the request. It is ranked only when the goal uses a request/response target.",
            "- **Market data lag** (when a feed target is present): local wall clock minus the exchange's event "
            "timestamp (ms resolution) on live pushes. It includes the clock offset between exchange and instance, so "
            "compare instances with each other, not as an absolute latency.", "",
            "WARN = loss, reconnects or no samples.", "",
            "## Goal", "", goal.get("description", "(no description)"), "", describe_goal(goal), "",
            "## Ranking by goal", "", table(
-               ["#", "Decision", "Candidate", "AZ ID", "CPG", "Instance", "Public IP"] + [f"{t} {metric}" for t in goal_targets],
+               ["#", "Decision", "Candidate", "AZ ID", "Placement group", "Instance", "Public IP"] + [f"{t} {metric}" for t in goal_targets],
                [[i + 1, "KEEP" if k in keep else "terminate"] + ident(k) + [cell(k, t) for t in goal_targets]
                 for i, k in enumerate(ranked)] +
                [["-", f"terminate ({why})"] + ident(k) + [cell(k, t) for t in goal_targets]
@@ -670,15 +730,15 @@ def render(rows, cands, goal, env=None, meta=None):
             out += ["No valid samples, see the detail table.", ""]
             continue
         if ranked_rows[0].get("kind") == "tcp":
-            out += [table(["#", "AZ ID", "CPG", "Instance", "Public IP", "Fastest endpoint IP", "TCP handshake RTT min", "p50", "p95",
+            out += [table(["#", "AZ ID", "Placement group", "Instance", "Public IP", "Fastest endpoint IP", "TCP handshake RTT min", "p50", "p95",
                            "p99", "Samples/lost"],
-                          [[i + 1, r["az_id"], r["cpg"], r["instance_id"], r["public_ip"], r["ip"], r["stats_us"]["min"],
+                          [[i + 1, r["az_id"], pg(r), r["instance_id"], r["public_ip"], r["ip"], r["stats_us"]["min"],
                             r["stats_us"]["p50"], r["stats_us"]["p95"], r["stats_us"]["p99"], f"{r['samples']}/{r['lost']}"]
                            for i, r in enumerate(ranked_rows)]), ""]
         else:
-            out += [table(["#", "AZ ID", "CPG", "Instance", "Public IP", "Fastest endpoint IP", "TCP handshake RTT", "TLS", "WS upgrade",
+            out += [table(["#", "AZ ID", "Placement group", "Instance", "Public IP", "Fastest endpoint IP", "TCP handshake RTT", "TLS", "WS upgrade",
                            "Req/resp RTT p50", "Req/resp p95", "Req/resp p99", "Samples/lost"],
-                          [[i + 1, r["az_id"], r["cpg"], r["instance_id"], r["public_ip"], r["ip"], ph(r, "tcp_p50"),
+                          [[i + 1, r["az_id"], pg(r), r["instance_id"], r["public_ip"], r["ip"], ph(r, "tcp_p50"),
                             ph(r, "tls"), ph(r, "ws"), r["stats_us"]["p50"], r["stats_us"]["p95"], r["stats_us"]["p99"],
                             f"{r['samples']}/{r['lost']}"]
                            for i, r in enumerate(ranked_rows)]), ""]
@@ -707,9 +767,9 @@ def render(rows, cands, goal, env=None, meta=None):
 
     out += env_section(rows + feed_rows, env, meta, len(cands))
     out += ["## Detail (every instance x exchange IP)", "", table(
-        ["Target", "AZ ID", "CPG", "Instance", "Public IP", "Exchange IP", "Samples", "Lost", "Errors", "Startup TCP RTT", "TLS",
+        ["Target", "AZ ID", "Placement group", "Instance", "Public IP", "Exchange IP", "Samples", "Lost", "Errors", "Startup TCP RTT", "TLS",
          "WS upgrade", "Measures", "p50", "p95", "p99", ""],
-        [[r["name"], r["az_id"], r["cpg"], r["instance_id"], r["public_ip"], r["ip"] or "-", r["samples"], r["lost"],
+        [[r["name"], r["az_id"], pg(r), r["instance_id"], r["public_ip"], r["ip"] or "-", r["samples"], r["lost"],
           r["errors"], ph(r, "tcp_p50"), ph(r, "tls"), ph(r, "ws"),
           {"tcp": "TCP handshake RTT", "feed": "market data lag"}.get(r.get("kind"), "req/resp RTT"),
           *((r["stats_us"][p] for p in ("p50", "p95", "p99")) if r["stats_us"] else ("-",) * 3),
@@ -720,7 +780,7 @@ def render(rows, cands, goal, env=None, meta=None):
     if not keep:
         out.append("- No candidate meets the goal. Every candidate will be terminated; consider another round.")
     for k in keep:
-        out.append(f"- Keep `{k}`: CPG `{c(k)['cpg']}` ({c(k)['az_id']}), instance `{c(k)['instance_id']}` / {c(k)['public_ip']}")
+        out.append(f"- Keep `{k}`: Placement group `{pg(c(k))}` ({c(k)['az_id']}), instance `{c(k)['instance_id']}` / {c(k)['public_ip']}")
         for t in goal_targets:
             r = best[t][k]
             if r.get("kind") == "tcp":
@@ -773,18 +833,32 @@ def report(results, goal_path, keep_override=None):
 
 # ---------------------------------------------------------------- prune
 
-def unsafe_changes(changes, keep, cands):
-    """Changes in a prune change set that are anything but removing a losing candidate (or its AZ's subnet)."""
-    kept_physical = {v for k in keep for v in (cands[k]["instance_id"], cands[k]["cpg"], cands[k]["subnet_id"])}
+def unsafe_changes(changes, keep, cands, configured_azs):
+    """Reject changes beyond removing losers or resources of an emptied AZ."""
+    kept_physical = {v for k in keep for v in (cands[k]["instance_id"],
+                     cands[k].get("placement_group", cands[k].get("cpg")), cands[k]["subnet_id"])}
     kept_azs = {cands[k]["az_id"] for k in keep}
-    kept_logical = {f"{p}{alnum(az)}" for az in kept_azs for p in ("Subnet", "Association")}
+    kept_logical = {f"{p}{alnum(az)}" for az in kept_azs for p in ("Subnet", "Association", "Ppg")}
+    kept_logical.update(f"{p}{alnum(k)}" for k in keep for p in ("Instance", "Cpg"))
+    empty_azs = set(configured_azs) - kept_azs
+    removable_lts = {f"LaunchTemplate{alnum(az)}P{n}" for az in empty_azs for n in range(1, PARTITIONS + 1)}
     bad = []
     for ch in changes:
         rc = ch["ResourceChange"]
         if not (rc["Action"] == "Remove" and rc["ResourceType"] in PRUNABLE
-                and rc.get("PhysicalResourceId") not in kept_physical and rc["LogicalResourceId"] not in kept_logical):
+                and rc.get("PhysicalResourceId") not in kept_physical and rc["LogicalResourceId"] not in kept_logical
+                and (rc["ResourceType"] != "AWS::EC2::LaunchTemplate" or rc["LogicalResourceId"] in removable_lts)):
             bad.append(f"{rc['Action']} {rc['ResourceType']} {rc['LogicalResourceId']}")
     return bad
+
+
+def unsafe_round_changes(changes, placement):
+    allowed = {"AWS::EC2::Instance"}
+    if placement == "cluster":
+        allowed.add("AWS::EC2::PlacementGroup")
+    return [f"{rc['Action']} {rc['ResourceType']} {rc['LogicalResourceId']}"
+            for ch in changes for rc in [ch["ResourceChange"]]
+            if rc["Action"] != "Add" or rc["ResourceType"] not in allowed]
 
 
 def prune(results):
@@ -800,33 +874,58 @@ def prune(results):
     missing = [k for k in keep if k not in cands]
     if missing:
         sys.exit(f"kept candidates {missing} are not running any more")
+    config = run / "config.json"
+    original = config.read_text()
+    configured_azs = cfg["az_subnets"]
     cfg["keep"], cfg["new"] = keep, []
     cfg["az_subnets"] = {az: cidr for az, cidr in cfg["az_subnets"].items() if az in {cands[k]["az_id"] for k in keep}}
-    (run / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
-    _, template = synth(run)
-
-    name = "prune-" + time.strftime("%Y%m%d%H%M%S")
-    aws("cloudformation", "create-change-set", "--stack-name", stack, "--change-set-name", name,
-        "--template-body", f"file://{template}", "--capabilities", "CAPABILITY_IAM")
+    config.write_text(json.dumps(cfg, indent=2) + "\n")
+    executed = False
     try:
-        sh("aws", "cloudformation", "wait", "change-set-create-complete", "--stack-name", stack, "--change-set-name", name)
-    except subprocess.CalledProcessError:
-        reason = aws("cloudformation", "describe-change-set", "--stack-name", stack, "--change-set-name", name)["StatusReason"]
-        aws("cloudformation", "delete-change-set", "--stack-name", stack, "--change-set-name", name)
-        if "didn't contain changes" in reason:
-            print("nothing to prune: only kept candidates are running")
-            return
-        sys.exit(f"change set failed: {reason}")
-    changes = aws("cloudformation", "describe-change-set", "--stack-name", stack, "--change-set-name", name)["Changes"]
-    bad = unsafe_changes(changes, keep, cands)
-    if bad:
-        aws("cloudformation", "delete-change-set", "--stack-name", stack, "--change-set-name", name)
-        sys.exit("refusing to prune, the change set does more than remove losers:\n  " + "\n  ".join(bad))
-    aws("cloudformation", "execute-change-set", "--stack-name", stack, "--change-set-name", name)
+        _, template = synth(run)
+        name = "prune-" + time.strftime("%Y%m%d%H%M%S")
+        aws("cloudformation", "create-change-set", "--stack-name", stack, "--change-set-name", name,
+            "--template-body", f"file://{template}", "--capabilities", "CAPABILITY_IAM")
+        try:
+            sh("aws", "cloudformation", "wait", "change-set-create-complete", "--stack-name", stack, "--change-set-name", name)
+        except subprocess.CalledProcessError:
+            reason = aws("cloudformation", "describe-change-set", "--stack-name", stack, "--change-set-name", name)["StatusReason"]
+            aws("cloudformation", "delete-change-set", "--stack-name", stack, "--change-set-name", name)
+            if "didn't contain changes" in reason:
+                print("nothing to prune: only kept candidates are running")
+                return
+            sys.exit(f"change set failed: {reason}")
+        changes = aws("cloudformation", "describe-change-set", "--stack-name", stack, "--change-set-name", name)["Changes"]
+        bad = unsafe_changes(changes, keep, cands, configured_azs)
+        if bad:
+            aws("cloudformation", "delete-change-set", "--stack-name", stack, "--change-set-name", name)
+            sys.exit("refusing to prune, the change set does more than remove losers:\n  " + "\n  ".join(bad))
+        aws("cloudformation", "execute-change-set", "--stack-name", stack, "--change-set-name", name)
+        executed = True
+    finally:
+        if not executed:
+            config.write_text(original)
     log(f"terminating {len(cands) - len(keep)} candidate(s)")
     sh("aws", "cloudformation", "wait", "stack-update-complete", "--stack-name", stack)
     print(json.dumps({"kept": {k: cands[k] for k in keep},
                       "terminated": {k: c["instance_id"] for k, c in cands.items() if k not in keep}}, indent=2))
+
+
+def partition_number(index):
+    return index % PARTITIONS + 1
+
+
+def challenger_keys(az, start, count, occupied):
+    free = set(range(1, PARTITIONS + 1)) - occupied
+    keys = []
+    index = start
+    for _ in range(count):
+        while free and partition_number(index) not in free:
+            index += 1
+        keys.append(f"{az}-{index}")
+        free.discard(partition_number(index))
+        index += 1
+    return keys, index
 
 
 def next_round(run, per_az):
@@ -842,25 +941,36 @@ def next_round(run, per_az):
     cfg["az_subnets"] = {az: cidr for az, cidr in cfg["az_subnets"].items() if az in {c["az_id"] for c in cands.values()}}
     cfg["new"] = []
     for az in cfg["az_subnets"]:
-        cfg["new"] += [f"{az}-{nxt[az] + i}" for i in range(per_az)]
-        nxt[az] += per_az
+        if cfg.get("placement", "cluster") == "partition":
+            occupied = {partition_number(int(k.rsplit("-", 1)[1])) for k in cands if cands[k]["az_id"] == az}
+            keys, nxt[az] = challenger_keys(az, nxt[az], per_az, occupied)
+            cfg["new"] += keys
+        else:
+            cfg["new"] += [f"{az}-{nxt[az] + i}" for i in range(per_az)]
+            nxt[az] += per_az
     total = len(cfg["keep"]) + len(cfg["new"])
     if total > 33:
         sys.exit(f"{total} candidates is over the ~33 the inline template can hold: use a smaller PER_AZ")
-    (run / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
-    _, template = synth(run)
-    name = "round-" + time.strftime("%Y%m%d%H%M%S")
-    aws("cloudformation", "create-change-set", "--stack-name", stack, "--change-set-name", name,
-        "--template-body", f"file://{template}", "--capabilities", "CAPABILITY_IAM")
-    sh("aws", "cloudformation", "wait", "change-set-create-complete", "--stack-name", stack, "--change-set-name", name)
-    changes = aws("cloudformation", "describe-change-set", "--stack-name", stack, "--change-set-name", name)["Changes"]
-    bad = [f"{c['ResourceChange']['Action']} {c['ResourceChange']['ResourceType']} {c['ResourceChange']['LogicalResourceId']}"
-           for c in changes if c["ResourceChange"]["Action"] != "Add"
-           or c["ResourceChange"]["ResourceType"] not in {"AWS::EC2::Instance", "AWS::EC2::PlacementGroup"}]
-    if bad:
-        aws("cloudformation", "delete-change-set", "--stack-name", stack, "--change-set-name", name)
-        sys.exit("refusing to extend, the change set does more than add challengers:\n  " + "\n  ".join(bad))
-    aws("cloudformation", "execute-change-set", "--stack-name", stack, "--change-set-name", name)
+    config = run / "config.json"
+    original = config.read_text()
+    config.write_text(json.dumps(cfg, indent=2) + "\n")
+    executed = False
+    try:
+        _, template = synth(run)
+        name = "round-" + time.strftime("%Y%m%d%H%M%S")
+        aws("cloudformation", "create-change-set", "--stack-name", stack, "--change-set-name", name,
+            "--template-body", f"file://{template}", "--capabilities", "CAPABILITY_IAM")
+        sh("aws", "cloudformation", "wait", "change-set-create-complete", "--stack-name", stack, "--change-set-name", name)
+        changes = aws("cloudformation", "describe-change-set", "--stack-name", stack, "--change-set-name", name)["Changes"]
+        bad = unsafe_round_changes(changes, cfg.get("placement", "cluster"))
+        if bad:
+            aws("cloudformation", "delete-change-set", "--stack-name", stack, "--change-set-name", name)
+            sys.exit("refusing to extend, the change set does more than add challengers:\n  " + "\n  ".join(bad))
+        aws("cloudformation", "execute-change-set", "--stack-name", stack, "--change-set-name", name)
+        executed = True
+    finally:
+        if not executed:
+            config.write_text(original)
     sh("aws", "cloudformation", "wait", "stack-update-complete", "--stack-name", stack)
     print(json.dumps(candidates(stack), indent=2))
 
@@ -907,15 +1017,129 @@ def selftest():
     assert "| instance_type | c8i.large |" in text and "6.1 (1 hosts); 6.2 (1 hosts)" in text and "net.core.busy_poll | 0 |" in text, text
     text, keep = render(ph_rows + [feed], cands, two_tier)
     assert keep == ["az1-b"] and "market data lag" in text and "| 450 | 6000 | 900 |" in text and "every endpoint IP, fastest first" in text
+    instances = [{"InstanceId": f"i-{n}", "InstanceType": "m8azn.large", "ImageId": "ami-test",
+                  "Placement": {"GroupName": "shared", "PartitionNumber": n, "Tenancy": "default"},
+                  "Monitoring": {"State": "disabled"}} for n in (1, 2)]
+    with patch.dict(globals(), {
+        "aws": lambda *args: {"NetworkInterfaces": []} if args[1] == "describe-network-interfaces" else instances,
+        "ssm": lambda *args: {"i-1": "{}", "i-2": "{}"},
+    }):
+        placement = collect_env(["i-1", "i-2"], {"az1-0": {"instance_id": "i-1", "az_id": "az1"},
+                                                   "az1-1": {"instance_id": "i-2", "az_id": "az1"}})["ec2"]
+    assert placement["i-1"]["placement"] == placement["i-2"]["placement"] == "partition placement group shared, tenancy default"
 
     change = lambda action, typ, lid, pid: {"ResourceChange": {"Action": action, "ResourceType": typ,
                                                                "LogicalResourceId": lid, "PhysicalResourceId": pid}}
     keep = ["az1-b"]
+    configured_azs = {"az1", "az4", "az9"}
     assert not unsafe_changes([change("Remove", "AWS::EC2::Instance", "Instanceaz1a", "i-az1-a"),
-                               change("Remove", "AWS::EC2::Subnet", "Subnetaz4", "s-az4")], keep, cands)
-    assert unsafe_changes([change("Remove", "AWS::EC2::Instance", "Instanceaz1b", "i-az1-b")], keep, cands)  # winner
-    assert unsafe_changes([change("Remove", "AWS::EC2::Subnet", "Subnetaz1", "s-az1")], keep, cands)  # winner's subnet
-    assert unsafe_changes([change("Modify", "AWS::EC2::LaunchTemplate", "LaunchTemplate", "lt-1")], keep, cands)
+                               change("Remove", "AWS::EC2::Subnet", "Subnetaz4", "s-az4")], keep, cands, configured_azs)
+    assert unsafe_changes([change("Remove", "AWS::EC2::Instance", "Instanceaz1b", "i-az1-b")], keep, cands, configured_azs)  # winner
+    assert unsafe_changes([change("Remove", "AWS::EC2::Subnet", "Subnetaz1", "s-az1")], keep, cands, configured_azs)  # winner's subnet
+    assert unsafe_changes([change("Modify", "AWS::EC2::LaunchTemplate", "LaunchTemplate", "lt-1")], keep, cands, configured_azs)
+    assert not unsafe_changes([change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz4P1", "lt-az4-1")], keep, cands, configured_azs)
+    assert not unsafe_changes([change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz9P1", "lt-az9-1")], keep, cands, configured_azs)
+    assert unsafe_changes([change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1P1", "lt-az1-1")], keep, cands, configured_azs)
+    assert unsafe_changes([change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateOtherP1", "lt-other-1")], keep, cands, configured_azs)
+    shared = {k: dict(c, cpg=f"g-{c['az_id']}") for k, c in cands.items()}
+    assert unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1", "g-az1")], keep, shared, configured_azs)
+    assert not unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz4", "g-az4")], keep, shared, configured_azs)
+    generic = {k: dict({field: value for field, value in c.items() if field != "cpg"},
+                       placement_group=f"g-{c['az_id']}") for k, c in cands.items()}
+    assert unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1", "g-az1")], keep, generic, configured_azs)
+    assert [partition_number(n) for n in (0, 1, 6, 7, 8, 13, 14)] == [1, 2, 7, 1, 2, 7, 1]
+    assert challenger_keys("az1", 7, 5, {1, 3, 6}) == (["az1-8", "az1-10", "az1-11", "az1-13", "az1-14"], 15)
+    assert challenger_keys("az1", 14, 2, {1, 2, 3, 4, 5, 6, 7}) == (["az1-14", "az1-15"], 16)
+    assert not unsafe_round_changes([change("Add", "AWS::EC2::Instance", "Instanceaz18", None)], "partition")
+    assert unsafe_round_changes([change("Add", "AWS::EC2::PlacementGroup", "Ppgaz1", None)], "partition")
+    assert unsafe_round_changes([change("Add", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1P1", None)], "partition")
+    assert not unsafe_round_changes([change("Add", "AWS::EC2::PlacementGroup", "Cpgaz18", None)], "cluster")
+    assert pg({"cpg": "group", "partition": 4}) == "group p4"
+    assert pg({"cpg": "group", "partition": None}) == "group"
+    assert pg({"placement_group": "group", "partition": 4}) == "group p4"
+    sync = probe_sync_commands()
+    assert f"test -x {BIN}" in sync[0]
+    assert "pipefail" in sync[-1] and f"rm -f {BIN}" in sync[-1]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        config = tmp / "config.json"
+        original = json.dumps({"stack": "offline-hunt", "az_subnets": {"az1": "10.0.0.0/27"},
+                               "instances_per_az": 1, "placement": "partition", "keep": []})
+        config.write_text(original)
+        test_cands = {"az1-0": {"az_id": "az1", "instance_id": "i-az1-0", "placement_group": "g-az1",
+                                "subnet_id": "s-az1"}}
+        bad_change = change("Modify", "AWS::EC2::Instance", "Instanceaz10", "i-az1-0")
+        fake_aws = lambda *args: {"Changes": [bad_change]} if args[1] == "describe-change-set" else {}
+        with patch.dict(globals(), {"aws": fake_aws, "sh": lambda *args: "",
+                                    "synth": lambda run: (load_cfg(run), tmp / "template.json"),
+                                    "candidates": lambda stack: test_cands}):
+            try:
+                next_round(tmp, 1)
+            except SystemExit as e:
+                assert "refusing to extend" in str(e)
+            assert config.read_text() == original
+            results = tmp / "results" / "first"
+            results.mkdir(parents=True)
+            (results / "keep.json").write_text(json.dumps({"keep": ["az1-0"]}))
+            try:
+                prune(results)
+            except SystemExit as e:
+                assert "refusing to prune" in str(e)
+            assert config.read_text() == original
+    python = VENV / "bin" / "python"
+    env = {**os.environ, "JSII_RUNTIME_PACKAGE_CACHE": "disabled"}
+    if not python.exists() or subprocess.run([str(python), "-c", "import aws_cdk"], env=env,
+                                             capture_output=True).returncode:
+        print("offline synth skipped (infra CDK venv unavailable)")
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = {"stack": "offline-hunt", "region": "us-east-1", "vpc_id": "vpc-12345678",
+                   "igw_id": "igw-12345678", "az_subnets": {"use1-az1": "10.0.0.0/27"},
+                   "instance_type": "m8azn.large", "instances_per_az": 7, "ami": "ami-12345678",
+                   "extra_routes": {}, "keep": [], "placement": "partition"}
+            config = tmp / "config.json"
+            for mode in ("partition", "partition-3az", "partition-4az", "legacy-cluster"):
+                cfg.pop("user_data", None)
+                cfg["az_subnets"] = {f"use1-az{n}": f"10.0.{n - 1}.0/27"
+                                     for n in range(1, 1 + (3 if mode == "partition-3az" else 4 if mode == "partition-4az" else 1))}
+                cfg["instances_per_az"] = 6 if mode == "partition-4az" else 7
+                if mode == "legacy-cluster":
+                    cfg.pop("placement")
+                config.write_text(json.dumps(cfg))
+                out = tmp / mode
+                synth_env = {**env, "CDK_CONTEXT_JSON": json.dumps({
+                    "config": str(config), "aws:cdk:enable-path-metadata": True}), "CDK_OUTDIR": str(out)}
+                result = subprocess.run([str(python), str(ROOT / "infra" / "app.py")], cwd=tmp, env=synth_env,
+                                        capture_output=True, text=True)
+                assert result.returncode == 0, result.stderr
+                template = out / "offline-hunt.template.json"
+                if mode == "partition-4az":
+                    assert template.stat().st_size > TEMPLATE_LIMIT
+                    assert template_size_and_max(cfg)[1] == 5
+                else:
+                    assert template.stat().st_size < TEMPLATE_LIMIT
+                if mode == "partition-3az":
+                    assert template_size_and_max(cfg)[0] < TEMPLATE_LIMIT
+                resources = json.loads(template.read_text())["Resources"]
+                lts = [r for r in resources.values() if r["Type"] == "AWS::EC2::LaunchTemplate"]
+                if mode == "partition":
+                    assert len(lts) == 7
+                    assert sorted(r["Properties"]["LaunchTemplateData"]["Placement"]["PartitionNumber"] for r in lts) == list(range(1, 8))
+                    for index in range(7):
+                        assert resources[f"Instanceuse1az1{index}"]["Properties"]["LaunchTemplate"]["LaunchTemplateId"] == {
+                            "Ref": f"LaunchTemplateuse1az1P{index + 1}"}
+                    original_lts = {k: v for k, v in resources.items() if v["Type"] == "AWS::EC2::LaunchTemplate"}
+                    pin_user_data(tmp, cfg, template)
+                    assert cfg["user_data"] == next(iter(original_lts.values()))["Properties"]["LaunchTemplateData"]["UserData"]
+                    result = subprocess.run([str(python), str(ROOT / "infra" / "app.py")], cwd=tmp, env=synth_env,
+                                            capture_output=True, text=True)
+                    assert result.returncode == 0, result.stderr
+                    repeated = json.loads(template.read_text())["Resources"]
+                    assert original_lts == {k: v for k, v in repeated.items() if v["Type"] == "AWS::EC2::LaunchTemplate"}
+                elif mode == "legacy-cluster":
+                    assert len(lts) == 1
+                    assert sum(r["Type"] == "AWS::EC2::PlacementGroup" for r in resources.values()) == 7
     print("selftest ok")
 
 
@@ -928,6 +1152,9 @@ if __name__ == "__main__":
     s.add_argument("--secs", type=int, default=MIN_SECS)
     s.add_argument("--ami", help="AMI id or SSM public parameter path (default: latest Amazon Linux 2023)")
     s.add_argument("--route", action="append", default=[], help="CIDR=pcx-xxx or CIDR=tgw-xxx")
+    s.add_argument("--placement", choices=["partition", "cluster"], default="partition",
+                   help="partition: 7 partitions per AZ in one partition placement group (default); "
+                        "cluster: one cluster placement group per candidate")
     sub.add_parser("deploy").add_argument("run")
     s = sub.add_parser("run")
     s.add_argument("run"), s.add_argument("targets"), s.add_argument("secs", type=int)
@@ -938,14 +1165,14 @@ if __name__ == "__main__":
     s.add_argument("run"), s.add_argument("per_az", type=int)
     sub.add_parser("prune").add_argument("results")
     s = sub.add_parser("destroy")
-    s.add_argument("run"), s.add_argument("--retain", action="store_true", help="keep CPGs used by non-hunt instances")
+    s.add_argument("run"), s.add_argument("--retain", action="store_true", help="keep placement groups used by non-hunt instances")
     sub.add_parser("list")
     sub.add_parser("selftest")
     a = p.parse_args()
     if a.cmd == "perms":
         sys.exit(perms())
     elif a.cmd == "preflight":
-        sys.exit(preflight(a.vpc, a.type, a.per_az, a.az_ids, a.secs, dict(r.split("=", 1) for r in a.route), a.ami))
+        sys.exit(preflight(a.vpc, a.type, a.per_az, a.az_ids, a.secs, dict(r.split("=", 1) for r in a.route), a.ami, a.placement))
     elif a.cmd == "deploy":
         deploy(a.run)
     elif a.cmd == "run":

@@ -2,11 +2,15 @@
 
 A Claude Code skill that hunts for the EC2 placement with the lowest WebSocket latency to crypto exchanges.
 
-It launches test instances in the AZ IDs you choose, each in its own cluster placement group. It then measures
+By default it launches test instances in one partition placement group per AZ, with 7 partitions whose rack sets never
+overlap. Seven candidates per AZ therefore test distinct rack sets. It then measures TCP handshake and WebSocket
 request/response RTT from every instance to every IP of every exchange endpoint at the same time, for at least
 5 minutes, and ranks the instances against your goal (for example "OKX order leg first, Binance market data second").
-At the end it keeps the winner and its CPG and terminates the rest. Production instances you launch into the winning CPG
-later land in the same network segment.
+At the end it keeps the winning **instance** and terminates the rest. Keep that instance running; `sudo reboot` is fine,
+but an OS-level shutdown, halt, or poweroff terminates the instance and its root volume. Stop/start can move it to
+another host. Another instance in the same partition is not guaranteed to be as fast: re-measure it.
+Use `--placement cluster` to give each candidate its own cluster placement group (CPG); in that mode the winning CPG
+can host production instances in the same network segment.
 
 ## Install
 
@@ -28,8 +32,8 @@ SKILL.md                 workflow Claude follows
 references/exchanges.md  how to pick and verify a measurement method per exchange
 targets.example.json     verified exchange targets
 scripts/hunt.py          perms, preflight, deploy, run, report, prune, destroy, list
-infra/app.py             CDK app: one stack per run (subnets, route table, SG, IAM, launch template, CPGs, instances)
-probe/                   Rust WebSocket RTT probe, built on the instances from user data
+infra/app.py             CDK app: one stack per run (subnets, route table, SG, IAM, launch templates, placement groups, instances)
+probe/                   Rust WebSocket RTT probe, synced and built on instances by hunt.py run
 runs/                    per-run config, synthesized templates and results (git-ignored)
 ```
 
@@ -41,8 +45,8 @@ Export `AWS_PROFILE` and `AWS_REGION` first.
 HUNT="python3 scripts/hunt.py"
 mkdir -p runs && cp targets.example.json runs/targets.json      # keep the targets you need
 $HUNT perms
-$HUNT preflight vpc-xxxx m8azn.large 7 apne1-az1 apne1-az4      # prints checks, creates runs/<stack>/
-                                                                # add --ami ami-xxx or /ssm/param to override AL2023
+$HUNT preflight vpc-xxxx m8azn.large 7 apne1-az1 apne1-az4      # partition is the default
+                                                                # add --placement cluster or --ami to override defaults
 $HUNT deploy runs/<stack>
 $HUNT run runs/<stack> runs/targets.json 30 --smoke
 $HUNT run runs/<stack> runs/targets.json 600                   # prints the results directory
@@ -52,6 +56,10 @@ $HUNT round runs/<stack> 5                                     # next round: 5 f
 $HUNT destroy runs/<stack> [--retain]                          # when done
 $HUNT selftest                                                 # ranking and prune-safety checks
 ```
+
+Seven candidates per AZ is the partition-mode sweet spot. With more than 7, candidates share partitions:
+candidate index `i` uses partition `i % 7 + 1`. The probe source is synced over SSM and built by `hunt.py run`;
+partition-mode user data only bootstraps the toolchain.
 
 ## How it measures
 
