@@ -64,7 +64,7 @@ for cidr, target in cfg["extra_routes"].items():  # dedicated exchange endpoints
                  vpc_peering_connection_id=target if target.startswith("pcx-") else None,
                  transit_gateway_id=target if target.startswith("tgw-") else None)
 
-sg = ec2.CfnSecurityGroup(stack, "SecurityGroup", vpc_id=vpc_id, group_description="ec2-hunting probes, egress only",
+sg = ec2.CfnSecurityGroup(stack, "SecurityGroup", vpc_id=vpc_id, group_description="aws-ec2-hunting probes, egress only",
                           security_group_egress=[ec2.CfnSecurityGroup.EgressProperty(ip_protocol="-1", cidr_ip="0.0.0.0/0")])
 role = iam.Role(stack, "Role", assumed_by=iam.ServicePrincipal("ec2.amazonaws.com"),
                 managed_policies=[iam.ManagedPolicy.from_aws_managed_policy_name("AmazonSSMManagedInstanceCore")])

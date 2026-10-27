@@ -396,7 +396,7 @@ def ssm(ids, commands, timeout, what):
     """Run commands on all ids, wait, return {instance_id: stdout} for the ones that succeeded."""
     params = json.dumps({"commands": commands, "executionTimeout": [str(timeout)]})
     cid = aws("ssm", "send-command", "--instance-ids", *ids, "--document-name", "AWS-RunShellScript",
-              "--comment", f"ec2-hunting {what}", "--parameters", params)["Command"]["CommandId"]
+              "--comment", f"aws-ec2-hunting {what}", "--parameters", params)["Command"]["CommandId"]
     log(f"{what}: command {cid} sent to {len(ids)} instance(s)")
     deadline = time.time() + timeout + 300
     while True:

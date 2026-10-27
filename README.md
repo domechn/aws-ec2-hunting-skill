@@ -1,4 +1,4 @@
-# ec2-hunting-skill
+# aws-ec2-hunting-skill
 
 A Claude Code skill that hunts for the EC2 placement with the lowest WebSocket latency to crypto exchanges.
 
@@ -11,8 +11,8 @@ later land in the same network segment.
 ## Install
 
 ```bash
-git clone <this repo> ~/ec2-hunting-skill
-ln -s ~/ec2-hunting-skill ~/.claude/skills/ec2-hunting
+git clone <this repo> ~/aws-ec2-hunting-skill
+ln -s ~/aws-ec2-hunting-skill ~/.claude/skills/aws-ec2-hunting
 ```
 
 Then ask Claude Code something like "run an EC2 hunt to Binance and OKX in Tokyo". The skill asks for the AWS profile,

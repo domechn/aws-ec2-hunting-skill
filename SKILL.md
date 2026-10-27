@@ -1,5 +1,5 @@
 ---
-name: ec2-hunting
+name: aws-ec2-hunting
 description: One-click EC2 hunting for low-latency crypto trading. Launches test EC2 instances in the AZ IDs the user picks (each in its own cluster placement group), measures WebSocket RTT from every instance to every IP of every exchange endpoint (Binance, OKX, Bybit, Bitget, Gate, Hyperliquid, or an exchange-provided dedicated endpoint) for at least 5 minutes, ranks them against the user's goal (e.g. order leg first, market-data leg second), reports TCP/TLS/WebSocket-upgrade/RTT breakdowns, live market-data lag and the fastest endpoint IP per instance, then keeps the winners and terminates the rest, optionally over several elimination rounds. Use this whenever someone wants to find the fastest AWS placement, AZ or instance for an exchange, compare AZ latency to an exchange, pick a cluster placement group for a trading host, or mentions EC2 hunting, exchange latency testing, tick-to-trade network optimization, or market-making / HFT placement, in any language, even without the word "hunting".
 ---
 
