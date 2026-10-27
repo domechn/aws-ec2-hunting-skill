@@ -1,0 +1,15 @@
+[
+  {"name": "binance-usdm-tcp", "kind": "tcp", "url": "wss://ws-fapi.binance.com/ws-fapi/v1", "interval_ms": 500},
+  {"name": "binance-usdm-api", "url": "wss://ws-fapi.binance.com/ws-fapi/v1", "request": "{\"id\":\"{id}\",\"method\":\"depth\",\"params\":{\"symbol\":\"BTCUSDT\",\"limit\":5}}", "match": "\"id\":\"{id}\""},
+  {"name": "binance-usdm-stream", "url": "wss://fstream.binance.com/ws", "request": "{\"method\":\"LIST_SUBSCRIPTIONS\",\"id\":{id}}", "match": "\"id\":{id}"},
+  {"name": "binance-usdm-feed", "url": "wss://fstream.binance.com/ws", "subscribe": "{\"method\":\"SUBSCRIBE\",\"params\":[\"btcusdt@bookTicker\"],\"id\":1}", "ts_key": "E"},
+  {"name": "binance-spot-api", "url": "wss://ws-api.binance.com:443/ws-api/v3", "request": "{\"id\":\"{id}\",\"method\":\"ping\"}", "match": "\"id\":\"{id}\""},
+  {"name": "binance-spot-stream", "url": "wss://stream.binance.com:443/ws", "request": "{\"method\":\"LIST_SUBSCRIPTIONS\",\"id\":{id}}", "match": "\"id\":{id}"},
+  {"name": "okx-public", "url": "wss://ws.okx.com:8443/ws/v5/public", "request": "ping", "match": "pong"},
+  {"name": "bybit-linear", "url": "wss://stream.bybit.com/v5/public/linear", "request": "{\"req_id\":\"{id}\",\"op\":\"ping\"}", "match": "\"req_id\":\"{id}\""},
+  {"name": "bybit-spot", "url": "wss://stream.bybit.com/v5/public/spot", "request": "{\"req_id\":\"{id}\",\"op\":\"ping\"}", "match": "\"req_id\":\"{id}\""},
+  {"name": "bitget-public", "url": "wss://ws.bitget.com/v2/ws/public", "request": "ping", "match": "pong"},
+  {"name": "gate-usdt-futures", "url": "wss://fx-ws.gateio.ws/v4/ws/usdt", "request": "{\"time\":{id},\"channel\":\"futures.ping\"}", "match": "futures.pong"},
+  {"name": "gate-spot", "url": "wss://api.gateio.ws/ws/v4/", "request": "{\"time\":{id},\"channel\":\"spot.ping\"}", "match": "spot.pong"},
+  {"name": "hyperliquid", "url": "wss://api.hyperliquid.xyz/ws", "request": "{\"method\":\"ping\"}", "match": "pong"}
+]
