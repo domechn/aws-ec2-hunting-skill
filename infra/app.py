@@ -4,6 +4,7 @@
 
 Placement modes (config "placement"):
   partition (default): candidate i uses group i // 7 and partition i % 7 + 1. Each group has 7 distinct rack sets.
+      placement_override pins challengers launched into an existing group/partition.
       Partition numbers can only be set in a launch template, so there is one launch template per partition
       and the user data is a small bootstrap (the probe source is synced over SSM by hunt.py).
   cluster: each candidate gets its own cluster placement group (also used by legacy configs without "placement").
@@ -113,8 +114,15 @@ for az_id, cidr in cfg["az_subnets"].items():
     else:
         keys = [f"{az_id}-{i}" for i in range(cfg["instances_per_az"])]
     if PARTITION_MODE:
+        def placement(key):
+            override = cfg.get("placement_override", {}).get(key)
+            if override:
+                return override["group"], override["partition"]
+            group, part_index = divmod(int(key.rsplit("-", 1)[1]), PARTITIONS)
+            return group, part_index + 1
+
         part_lts = {}
-        for group in sorted({int(key.rsplit("-", 1)[1]) // PARTITIONS for key in keys}):
+        for group in sorted({placement(key)[0] for key in keys}):
             suffix = f"G{group}" if group else ""
             ppg = ec2.CfnPlacementGroup(stack, f"Ppg{alnum(az_id)}{suffix}",
                                         strategy="partition", partition_count=PARTITIONS)
@@ -124,8 +132,8 @@ for az_id, cidr in cfg["az_subnets"].items():
                 for n in range(1, PARTITIONS + 1)}
     for key in keys:
         if PARTITION_MODE:
-            group, partition = divmod(int(key.rsplit("-", 1)[1]), PARTITIONS)
-            lt, kwargs = part_lts[group][partition + 1], {}
+            group, partition = placement(key)
+            lt, kwargs = part_lts[group][partition], {}
         else:
             lt, kwargs = launch_template, {"placement_group_name": ec2.CfnPlacementGroup(stack, f"Cpg{alnum(key)}", strategy="cluster").ref}
         instance = ec2.CfnInstance(

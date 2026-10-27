@@ -10,7 +10,8 @@ A run is one CloudFormation stack (synthesized by infra/app.py) plus a local dir
   hunt.py run RUN TARGETS SECS [--smoke]              probe every candidate at the same moment, save results
   hunt.py report RESULTS [--goal GOAL] [--keep N]     rank by goal, write report.md and keep.json
   hunt.py prune RESULTS                               terminate every candidate not in keep.json (change set is checked)
-  hunt.py round RUN PER_AZ                            partition: 7 challengers per AZ in a new group; cluster: PER_AZ
+  hunt.py round RUN COUNT [--into AZ_ID:GROUP:PARTITION]
+                                                      partition: 7 per AZ in a new group, or 1..20 into an existing partition; cluster: COUNT per AZ
   hunt.py destroy RUN [--retain]                      delete the whole stack, kept winners included
   hunt.py list                                        hunting stacks in this region
   hunt.py selftest
@@ -19,6 +20,7 @@ import argparse
 import base64
 import gzip
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -861,7 +863,7 @@ def report(results, goal_path, keep_override=None):
 
 # ---------------------------------------------------------------- prune
 
-def unsafe_changes(changes, keep, cands, configured_azs):
+def unsafe_changes(changes, keep, cands, configured_azs, placement_override=None):
     """Reject changes beyond removing losers, empty groups, or resources of an emptied AZ."""
     kept_physical = {v for k in keep for v in (cands[k]["instance_id"],
                      cands[k].get("placement_group", cands[k].get("cpg")), cands[k]["subnet_id"])}
@@ -869,10 +871,11 @@ def unsafe_changes(changes, keep, cands, configured_azs):
     empty_azs = set(configured_azs) - kept_azs
     protected = set()
     kept_groups = {cands[k].get("placement_group", cands[k].get("cpg")) for k in keep}
+    placement_override = placement_override or {}
     for key, cand in cands.items():
         index = key.rsplit("-", 1)[1]
         if index.isdigit():
-            group = (cand["az_id"], partition_placement(int(index))[0])
+            group = (cand["az_id"], placement_override.get(key, {}).get("group", partition_placement(int(index))[0]))
             if key in keep or cand.get("placement_group", cand.get("cpg")) in kept_groups:
                 protected.add(group)
         elif key in keep:
@@ -910,8 +913,10 @@ def unsafe_changes(changes, keep, cands, configured_azs):
     return bad
 
 
-def unsafe_round_changes(changes, placement):
-    allowed = {"AWS::EC2::Instance", "AWS::EC2::PlacementGroup"}
+def unsafe_round_changes(changes, placement, into=None):
+    allowed = {"AWS::EC2::Instance"}
+    if into is None:
+        allowed.add("AWS::EC2::PlacementGroup")
     if placement == "partition":
         allowed.add("AWS::EC2::LaunchTemplate")
     return [f"{rc['Action']} {rc['ResourceType']} {rc['LogicalResourceId']}"
@@ -954,7 +959,7 @@ def prune(results):
                 return
             sys.exit(f"change set failed: {reason}")
         changes = aws("cloudformation", "describe-change-set", "--stack-name", stack, "--change-set-name", name)["Changes"]
-        bad = unsafe_changes(changes, keep, cands, configured_azs)
+        bad = unsafe_changes(changes, keep, cands, configured_azs, cfg.get("placement_override"))
         if bad:
             aws("cloudformation", "delete-change-set", "--stack-name", stack, "--change-set-name", name)
             sys.exit("refusing to prune, the change set does more than remove losers:\n  " + "\n  ".join(bad))
@@ -974,22 +979,55 @@ def partition_placement(index):
     return group, partition + 1
 
 
-def next_round(run, per_az):
+def configured_placement(cfg, key):
+    override = cfg.get("placement_override", {}).get(key)
+    if override:
+        return override
+    group, partition = partition_placement(int(key.rsplit("-", 1)[1]))
+    return {"group": group, "partition": partition}
+
+
+def next_round(run, per_az, into=None):
     """Add fresh challengers in every AZ the stack still has, next to the running winners (never touched)."""
     run = Path(run)
     cfg = load_cfg(run)
-    if cfg.get("placement", "cluster") == "partition" and per_az != PARTITIONS:
+    placement = cfg.get("placement", "cluster")
+    if into is not None:
+        if placement != "partition":
+            sys.exit("--into requires partition placement")
+        if not 1 <= per_az <= 20:
+            sys.exit("--into count must be 1..20")
+        az, group, partition = into
+        if group < 0 or not 1 <= partition <= PARTITIONS:
+            sys.exit(f"--into needs a nonnegative group and partition 1..{PARTITIONS}")
+        if az not in cfg["az_subnets"]:
+            sys.exit(f"--into AZ {az} has no subnet in this stack")
+        existing = cfg["keep"] + cfg.get("new", []) if cfg["keep"] else [
+            f"{az}-{i}" for i in range(cfg["instances_per_az"])]
+        if not any(key.startswith(f"{az}-") and configured_placement(cfg, key)["group"] == group
+                   for key in existing):
+            sys.exit(f"--into placement group {az}:{group} does not exist in the config")
+    elif placement == "partition" and per_az != PARTITIONS:
         sys.exit(f"partition rounds require exactly {PARTITIONS} challengers per AZ (one fresh placement group)")
     stack = cfg["stack"]
     cands = candidates(stack)
     if not cands:
         sys.exit("no running candidates: nothing to extend")
+    if into is not None and az not in {c["az_id"] for c in cands.values()}:
+        sys.exit(f"--into AZ {az} has no running candidate")
     nxt = cfg.setdefault("next_index", {az: cfg["instances_per_az"] for az in cfg["az_subnets"]})
     cfg["keep"] = list(cands)  # whatever runs now are the incumbents
     cfg["az_subnets"] = {az: cidr for az, cidr in cfg["az_subnets"].items() if az in {c["az_id"] for c in cands.values()}}
     cfg["new"] = []
     for az in cfg["az_subnets"]:
-        if cfg.get("placement", "cluster") == "partition":
+        if into is not None:
+            if az == into[0]:
+                keys = [f"{az}-{i}" for i in range(nxt[az], nxt[az] + per_az)]
+                cfg["new"] += keys
+                cfg.setdefault("placement_override", {}).update(
+                    {key: {"group": group, "partition": partition} for key in keys})
+                nxt[az] += per_az
+        elif placement == "partition":
             start = ((nxt[az] + PARTITIONS - 1) // PARTITIONS) * PARTITIONS
             cfg["new"] += [f"{az}-{i}" for i in range(start, start + PARTITIONS)]
             nxt[az] = start + PARTITIONS
@@ -1012,7 +1050,7 @@ def next_round(run, per_az):
             "--template-body", f"file://{template}", "--capabilities", "CAPABILITY_IAM")
         sh("aws", "cloudformation", "wait", "change-set-create-complete", "--stack-name", stack, "--change-set-name", name)
         changes = aws("cloudformation", "describe-change-set", "--stack-name", stack, "--change-set-name", name)["Changes"]
-        bad = unsafe_round_changes(changes, cfg.get("placement", "cluster"))
+        bad = unsafe_round_changes(changes, placement, into)
         if bad:
             aws("cloudformation", "delete-change-set", "--stack-name", stack, "--change-set-name", name)
             sys.exit("refusing to extend, the change set does more than add challengers:\n  " + "\n  ".join(bad))
@@ -1128,6 +1166,21 @@ def selftest():
     assert unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1", "g-az1-0"),
                            change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1P1", "lt-0-1")],
                           ["az1-0"], group_cands, {"az1"})
+    into_cands = {"az1-0": group_cands["az1-0"],
+                  "az1-7": dict(group_cands["az1-7"], placement_group="g-az1-0", partition=4)}
+    override = {"az1-7": {"group": 0, "partition": 4}}
+    for winner in ("az1-0", "az1-7"):
+        assert unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1", "g-az1-0")],
+                              [winner], into_cands, {"az1"}, override)
+        assert unsafe_changes([change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1P4", "lt-0-4")],
+                              [winner], into_cands, {"az1"}, override)
+        loser = "az1-7" if winner == "az1-0" else "az1-0"
+        assert not unsafe_changes([change("Remove", "AWS::EC2::Instance", f"Instance{alnum(loser)}",
+                                          into_cands[loser]["instance_id"])],
+                                  [winner], into_cands, {"az1"}, override)
+    assert not unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1G1", "g-az1-1"),
+                               change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1G1P4", "lt-1-4")],
+                              ["az1-7"], into_cands, {"az1"}, override)
     assert not unsafe_round_changes([change("Add", "AWS::EC2::Instance", "Instanceaz18", None)], "partition")
     assert not unsafe_round_changes([change("Add", "AWS::EC2::Instance", "Instanceaz17", None),
                                      change("Add", "AWS::EC2::PlacementGroup", "Ppgaz1G1", None),
@@ -1135,6 +1188,31 @@ def selftest():
     assert unsafe_round_changes([change("Modify", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1P1", "lt-1")], "partition")
     assert unsafe_round_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1", "g-1")], "partition")
     assert not unsafe_round_changes([change("Add", "AWS::EC2::PlacementGroup", "Cpgaz18", None)], "cluster")
+    assert not unsafe_round_changes([change("Add", "AWS::EC2::Instance", "Instanceaz17", None),
+                                     change("Add", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1P4", None)],
+                                    "partition", into=("az1", 0, 4))
+    assert not unsafe_round_changes([change("Add", "AWS::EC2::Instance", "Instanceaz17", None)],
+                                    "partition", into=("az1", 0, 4))
+    assert unsafe_round_changes([change("Add", "AWS::EC2::PlacementGroup", "Ppgaz1G1", None)],
+                                "partition", into=("az1", 0, 4))
+    assert unsafe_round_changes([change("Modify", "AWS::EC2::Instance", "Instanceaz10", "i-0")],
+                                "partition", into=("az1", 0, 4))
+    replacing = change("Modify", "AWS::EC2::Instance", "Instanceaz10", "i-0")
+    replacing["ResourceChange"]["Replacement"] = "True"
+    assert unsafe_round_changes([replacing], "partition", into=("az1", 0, 4))
+    parser = make_parser()
+    assert parser.parse_args(["round", "runs/example", "20", "--into", "apne1-az4:3:4"]).into == ("apne1-az4", 3, 4)
+    for bad_args in (["round", "runs/example", "1", "--into", "apne1-az4:3"],
+                     ["round", "runs/example", "1", "--into", "apne1-az4:x:4"],
+                     ["round", "runs/example", "1", "--into", "apne1-az4:3:0"],
+                     ["round", "runs/example", "1", "--into", "apne1-az4:3:8"]):
+        with patch.object(sys, "stderr", io.StringIO()):
+            try:
+                parser.parse_args(bad_args)
+            except SystemExit as e:
+                assert e.code == 2
+            else:
+                assert False, f"accepted {bad_args}"
     assert pg({"cpg": "group", "partition": 4}) == "group p4"
     assert pg({"cpg": "group", "partition": None}) == "group"
     assert pg({"placement_group": "group", "partition": 4}) == "group p4"
@@ -1198,6 +1276,39 @@ def selftest():
             assert staged[-1]["new"] == [f"az1-{n}" for n in range(7, 14)]
             assert staged[-1]["next_index"]["az1"] == 14
             assert config.read_text() == original
+            try:
+                next_round(tmp, 1, into=("az1", 0, 4))
+            except SystemExit as e:
+                assert "refusing to extend" in str(e)
+            assert staged[-1]["new"] == ["az1-1"]
+            assert staged[-1]["next_index"]["az1"] == 2
+            assert staged[-1]["placement_override"] == {"az1-1": {"group": 0, "partition": 4}}
+            assert config.read_text() == original
+            group3_cfg = {**json.loads(original), "keep": ["az1-24"], "next_index": {"az1": 25}}
+            config.write_text(json.dumps(group3_cfg))
+            with patch.dict(globals(), {"candidates": lambda stack: {
+                    "az1-24": dict(test_cands["az1-0"], instance_id="i-24")}}):
+                try:
+                    next_round(tmp, 2, into=("az1", 3, 4))
+                except SystemExit as e:
+                    assert "refusing to extend" in str(e)
+            assert staged[-1]["new"] == ["az1-25", "az1-26"]
+            assert staged[-1]["next_index"]["az1"] == 27
+            assert all(staged[-1]["placement_override"][key] == {"group": 3, "partition": 4}
+                       for key in ("az1-25", "az1-26"))
+            assert json.loads(config.read_text()) == group3_cfg
+            config.write_text(original)
+            for count, target, reason in ((0, ("az1", 0, 4), "1..20"),
+                                          (21, ("az1", 0, 4), "1..20"),
+                                          (1, ("az9", 0, 4), "subnet"),
+                                          (1, ("az1", 1, 4), "does not exist")):
+                try:
+                    next_round(tmp, count, into=target)
+                except SystemExit as e:
+                    assert reason in str(e), str(e)
+                else:
+                    assert False, f"accepted {count=} {target=}"
+                assert config.read_text() == original
             results = tmp / "results" / "first"
             results.mkdir(parents=True)
             (results / "keep.json").write_text(json.dumps({"keep": ["az1-0"]}))
@@ -1288,10 +1399,12 @@ def selftest():
                    "extra_routes": {}, "keep": [], "placement": "partition"}
             config = tmp / "config.json"
             for mode in ("partition", "partition-round", "partition-pruned-group1",
+                         "partition-into", "partition-pruned-into-new", "partition-pruned-into-old",
                          "partition-3az", "partition-4az", "legacy-cluster"):
                 cfg.pop("user_data", None)
                 cfg["keep"] = []
                 cfg.pop("new", None)
+                cfg.pop("placement_override", None)
                 cfg["az_subnets"] = {f"use1-az{n}": f"10.0.{n - 1}.0/27"
                                      for n in range(1, 1 + (3 if mode == "partition-3az" else 4 if mode == "partition-4az" else 1))}
                 cfg["instances_per_az"] = 6 if mode == "partition-4az" else 7
@@ -1300,6 +1413,13 @@ def selftest():
                     cfg["new"] = [f"use1-az1-{n}" for n in range(7, 14)]
                 elif mode == "partition-pruned-group1":
                     cfg["keep"] = ["use1-az1-7"]
+                elif mode == "partition-into":
+                    cfg["keep"] = ["use1-az1-1", "use1-az1-3"]
+                    cfg["new"] = ["use1-az1-7"]
+                    cfg["placement_override"] = {"use1-az1-7": {"group": 0, "partition": 4}}
+                elif mode.startswith("partition-pruned-into"):
+                    cfg["keep"] = ["use1-az1-7" if mode.endswith("new") else "use1-az1-3"]
+                    cfg["placement_override"] = {"use1-az1-7": {"group": 0, "partition": 4}}
                 if mode == "legacy-cluster":
                     cfg.pop("placement")
                 config.write_text(json.dumps(cfg))
@@ -1337,6 +1457,7 @@ def selftest():
                     assert original_lts == {k: v for k, v in repeated.items() if v["Type"] == "AWS::EC2::LaunchTemplate"}
                     group0 = {k: v for k, v in resources.items() if k == "Ppguse1az1" or k.startswith("LaunchTemplateuse1az1P")}
                     assert len(group0) == 8
+                    original_instances = {k: v for k, v in resources.items() if v["Type"] == "AWS::EC2::Instance"}
                 elif mode == "partition-round":
                     assert sum(r["Type"] == "AWS::EC2::PlacementGroup" for r in resources.values()) == 2
                     assert len(lts) == 14
@@ -1346,13 +1467,33 @@ def selftest():
                 elif mode == "partition-pruned-group1":
                     assert "Ppguse1az1" not in resources and "Ppguse1az1G1" in resources
                     assert len(lts) == 7
+                elif mode == "partition-into":
+                    assert {k: resources[k] for k in group0} == group0
+                    assert resources["Instanceuse1az11"] == original_instances["Instanceuse1az11"]
+                    assert resources["Instanceuse1az13"] == original_instances["Instanceuse1az13"]
+                    assert resources["Instanceuse1az17"]["Properties"]["LaunchTemplate"]["LaunchTemplateId"] == {
+                        "Ref": "LaunchTemplateuse1az1P4"}
+                    assert "Ppguse1az1G1" not in resources
+                    into_instances = {k: v for k, v in resources.items() if v["Type"] == "AWS::EC2::Instance"}
+                elif mode.startswith("partition-pruned-into"):
+                    winner = "Instanceuse1az17" if mode.endswith("new") else "Instanceuse1az13"
+                    assert {k: resources[k] for k in group0} == group0
+                    assert {k: v for k, v in resources.items() if v["Type"] == "AWS::EC2::Instance"} == {
+                        winner: into_instances[winner]}
                 elif mode == "legacy-cluster":
                     assert len(lts) == 1
                     assert sum(r["Type"] == "AWS::EC2::PlacementGroup" for r in resources.values()) == 7
     print("selftest ok")
 
 
-if __name__ == "__main__":
+def parse_into(value):
+    match = re.fullmatch(r"([^:]+):([0-9]+):([1-7])", value)
+    if not match:
+        raise argparse.ArgumentTypeError("--into must be AZ_ID:GROUP:PARTITION (group >= 0, partition 1..7)")
+    return match.group(1), int(match.group(2)), int(match.group(3))
+
+
+def make_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("perms")
@@ -1372,13 +1513,19 @@ if __name__ == "__main__":
     s.add_argument("results"), s.add_argument("--goal"), s.add_argument("--keep", type=int, help="override goal keep")
     s = sub.add_parser("round")
     s.add_argument("run"), s.add_argument("per_az", type=int,
-                                          help="partition: exactly 7 per AZ; cluster: count per AZ")
+                                          help="partition: exactly 7 per AZ by default; with --into: 1..20 into one partition; cluster: count per AZ")
+    s.add_argument("--into", type=parse_into, metavar="AZ_ID:GROUP:PARTITION",
+                   help="add challengers to an existing partition placement group in this AZ")
     sub.add_parser("prune").add_argument("results")
     s = sub.add_parser("destroy")
     s.add_argument("run"), s.add_argument("--retain", action="store_true", help="keep placement groups used by non-hunt instances")
     sub.add_parser("list")
     sub.add_parser("selftest")
-    a = p.parse_args()
+    return p
+
+
+if __name__ == "__main__":
+    a = make_parser().parse_args()
     if a.cmd == "perms":
         sys.exit(perms())
     elif a.cmd == "preflight":
@@ -1390,7 +1537,7 @@ if __name__ == "__main__":
     elif a.cmd == "report":
         report(a.results, a.goal, a.keep)
     elif a.cmd == "round":
-        next_round(a.run, a.per_az)
+        next_round(a.run, a.per_az, a.into)
     elif a.cmd == "prune":
         prune(a.results)
     elif a.cmd == "destroy":

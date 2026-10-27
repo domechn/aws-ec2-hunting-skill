@@ -225,6 +225,12 @@ Repeat for each requested round. In cluster mode, `$HUNT round runs/<stack> <cha
 configurable count and survivor flow. Tell the user the round number and who survived; show how the final winner
 ranked in every round (the earlier `results/` dirs).
 
+To test within an existing partition instead, use `$HUNT round runs/<stack> <count> --into <az-id>:<ppg-group-index>:<partition>`
+with 1–20 challengers; for example, `--into apne1-az4:3:4` targets group 3, partition 4 in that AZ (the group
+of candidate `apne1-az4-24` is `24 // 7 = 3`). The AZ and group must still exist in the stack. This reuses its
+PPG and adds instances only (or a launch template for that partition if needed). Instances in the same partition
+share racks, so comparing the challengers with the incumbent measures within-partition latency variance.
+
 ### 13. Hand-off
 
 Tell the user (the skill itself never launches production):
