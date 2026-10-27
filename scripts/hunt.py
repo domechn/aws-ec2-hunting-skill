@@ -10,7 +10,7 @@ A run is one CloudFormation stack (synthesized by infra/app.py) plus a local dir
   hunt.py run RUN TARGETS SECS [--smoke]              probe every candidate at the same moment, save results
   hunt.py report RESULTS [--goal GOAL] [--keep N]     rank by goal, write report.md and keep.json
   hunt.py prune RESULTS                               terminate every candidate not in keep.json (change set is checked)
-  hunt.py round RUN PER_AZ                            next round: add PER_AZ fresh challengers per AZ next to the winners
+  hunt.py round RUN PER_AZ                            partition: 7 challengers per AZ in a new group; cluster: PER_AZ
   hunt.py destroy RUN [--retain]                      delete the whole stack, kept winners included
   hunt.py list                                        hunting stacks in this region
   hunt.py selftest
@@ -227,7 +227,7 @@ def preflight(vpc_id, itype, per_az, az_ids, secs, routes, ami_spec=None, placem
     if placement == "cluster" and itype.startswith("t") and itype[1].isdigit():
         add("FAIL", "T family instances can't join a cluster placement group")
     if placement == "partition":
-        add("OK", "partition placement group per AZ, 7 partitions (rack sets that never overlap); candidate i -> partition i%7+1")
+        add("OK", "partition placement groups of 7 rack sets; candidate i -> group i//7, partition i%7+1")
 
     count = per_az * len(az_ids)
     need = info["VCpuInfo"]["DefaultVCpus"] * count
@@ -286,12 +286,22 @@ def preflight(vpc_id, itype, per_az, az_ids, secs, routes, ami_spec=None, placem
            "placement": placement}
     if az_subnets:
         try:
-            size, maximum = template_size_and_max(cfg)
-            if size <= TEMPLATE_LIMIT:
-                add("OK", f"template {size} bytes (inline limit {TEMPLATE_LIMIT})")
+            size, round_size, maximum = template_size_and_max(cfg)
+            if max(size, round_size or 0) <= TEMPLATE_LIMIT:
+                detail = f"; next keep-1 partition round {round_size} bytes" if round_size else ""
+                add("OK", f"template {size} bytes{detail} (inline limit {TEMPLATE_LIMIT})")
+                if round_size and len(az_ids) > 1:
+                    all_az_round_size = offline_template_size(round_template_cfg(cfg, keep_per_az=True))
+                    if all_az_round_size > TEMPLATE_LIMIT:
+                        add("WARN", f"keeping a winner in every AZ makes the next round {all_az_round_size} bytes, "
+                            f"over the {TEMPLATE_LIMIT}-byte inline limit; keep 1 overall or split AZs into separate runs")
             else:
-                add("FAIL", f"template {size} bytes exceeds the {TEMPLATE_LIMIT}-byte inline limit; "
-                    f"max candidates per AZ that fit: {maximum if maximum is not None else 'none'}")
+                detail = f"; next keep-1 partition round {round_size} bytes" if round_size else ""
+                label = ("max initial candidates per AZ that still allow a keep-1 round" if round_size else
+                         "max candidates per AZ that fit")
+                add("FAIL", f"template {size} bytes{detail} exceeds the {TEMPLATE_LIMIT}-byte inline limit; "
+                    f"{label}: "
+                    f"{maximum if maximum is not None else 'none for these AZs (split into separate runs)'}")
         except (subprocess.CalledProcessError, OSError) as e:
             add("FAIL", f"could not synthesize template: {err_line(e)}")
 
@@ -332,18 +342,35 @@ def offline_template_size(cfg):
         return (out / f"{cfg['stack']}.template.json").stat().st_size
 
 
+def round_template_cfg(candidate, keep_per_az=False):
+    start = ((candidate["instances_per_az"] + PARTITIONS - 1) // PARTITIONS) * PARTITIONS
+    azs = list(candidate["az_subnets"])
+    if not keep_per_az:
+        azs = azs[:1]
+    return {**candidate, "az_subnets": {az: candidate["az_subnets"][az] for az in azs},
+            "keep": [f"{az}-0" for az in azs],
+            "new": [f"{az}-{n}" for az in azs for n in range(start, start + PARTITIONS)]}
+
+
 def template_size_and_max(cfg):
     size = offline_template_size(cfg)
-    if size <= TEMPLATE_LIMIT:
-        return size, None
-    low, high = 0, cfg["instances_per_az"] - 1
+    round_size = offline_template_size(round_template_cfg(cfg)) if cfg.get("placement", "cluster") == "partition" else None
+    if max(size, round_size or 0) <= TEMPLATE_LIMIT:
+        return size, round_size, None
+    def fits(count):
+        candidate = {**cfg, "instances_per_az": count}
+        return (offline_template_size(candidate) <= TEMPLATE_LIMIT and
+                (round_size is None or offline_template_size(round_template_cfg(candidate)) <= TEMPLATE_LIMIT))
+    if cfg["instances_per_az"] <= 1 or not fits(1):
+        return size, round_size, None
+    low, high = 1, cfg["instances_per_az"] - 1
     while low < high:
         middle = (low + high + 1) // 2
-        if offline_template_size({**cfg, "instances_per_az": middle}) <= TEMPLATE_LIMIT:
+        if fits(middle):
             low = middle
         else:
             high = middle - 1
-    return size, low if low or offline_template_size({**cfg, "instances_per_az": 0}) <= TEMPLATE_LIMIT else None
+    return size, round_size, low
 
 
 def cdk(*args):
@@ -373,8 +400,9 @@ def synth(run):
     cfg = pin_user_data(run, cfg, template)
     size = len(template.read_bytes())
     if size > TEMPLATE_LIMIT:
-        sys.exit(f"template is {size} bytes, over the {TEMPLATE_LIMIT}-byte inline limit: "
-                 "use fewer candidates per AZ or split the AZs into separate runs")
+        advice = ("keep 1 overall or split AZs into separate runs" if cfg.get("placement", "cluster") == "partition"
+                  else "use fewer candidates per AZ or split the AZs into separate runs")
+        sys.exit(f"template is {size} bytes, over the {TEMPLATE_LIMIT}-byte inline limit: {advice}")
     return cfg, template
 
 
@@ -653,7 +681,7 @@ def env_section(rows, env, meta, n_cands):
            "TLS and WS upgrade are timed on the first connection of each IP.",
            "- **Network path**: instance public IPv4 -> Internet Gateway -> exchange public IP. No NAT gateway, VPN, PrivateLink, "
            "peering or Transit Gateway unless the run was given `--route`. Security group: egress only.",
-           f"- **Placement and window**: cluster mode gives each candidate its own placement group; partition mode uses one group per AZ and assigns candidate index i to partition i % 7 + 1 (indices above 6 reuse partitions). "
+           f"- **Placement and window**: cluster mode gives each candidate its own placement group; partition mode assigns candidate index i to group i // 7 and partition i % 7 + 1. Each further round gets a fresh group per AZ. "
            f"{n_cands} candidates probed at the same moment for {secs} s. Exchange hostnames are resolved on each instance at start, "
            "so the IP sets can differ between instances.", ""]
     if env:
@@ -834,28 +862,58 @@ def report(results, goal_path, keep_override=None):
 # ---------------------------------------------------------------- prune
 
 def unsafe_changes(changes, keep, cands, configured_azs):
-    """Reject changes beyond removing losers or resources of an emptied AZ."""
+    """Reject changes beyond removing losers, empty groups, or resources of an emptied AZ."""
     kept_physical = {v for k in keep for v in (cands[k]["instance_id"],
                      cands[k].get("placement_group", cands[k].get("cpg")), cands[k]["subnet_id"])}
     kept_azs = {cands[k]["az_id"] for k in keep}
-    kept_logical = {f"{p}{alnum(az)}" for az in kept_azs for p in ("Subnet", "Association", "Ppg")}
-    kept_logical.update(f"{p}{alnum(k)}" for k in keep for p in ("Instance", "Cpg"))
     empty_azs = set(configured_azs) - kept_azs
-    removable_lts = {f"LaunchTemplate{alnum(az)}P{n}" for az in empty_azs for n in range(1, PARTITIONS + 1)}
+    protected = set()
+    kept_groups = {cands[k].get("placement_group", cands[k].get("cpg")) for k in keep}
+    for key, cand in cands.items():
+        index = key.rsplit("-", 1)[1]
+        if index.isdigit():
+            group = (cand["az_id"], partition_placement(int(index))[0])
+            if key in keep or cand.get("placement_group", cand.get("cpg")) in kept_groups:
+                protected.add(group)
+        elif key in keep:
+            protected.add((cand["az_id"], 0))
+    kept_instances = {f"Instance{alnum(k)}" for k in keep}
+    kept_cpgs = {f"Cpg{alnum(k)}" for k in keep}
+
+    def removable_group(lid, prefix, tail=""):
+        for az in configured_azs:
+            match = re.fullmatch(rf"{prefix}{alnum(az)}(?:G([1-9][0-9]*))?{tail}", lid)
+            if match:
+                return (az, int(match.group(1) or 0)) not in protected
+        return False
+
     bad = []
     for ch in changes:
         rc = ch["ResourceChange"]
+        typ, lid = rc["ResourceType"], rc["LogicalResourceId"]
+        if typ == "AWS::EC2::Instance":
+            allowed = lid.startswith("Instance") and lid not in kept_instances
+        elif typ == "AWS::EC2::PlacementGroup":
+            allowed = (lid.startswith("Cpg") and lid not in kept_cpgs) or removable_group(lid, "Ppg")
+        elif typ == "AWS::EC2::LaunchTemplate":
+            allowed = removable_group(lid, "LaunchTemplate", rf"P[1-{PARTITIONS}]")
+        elif typ == "AWS::EC2::Subnet":
+            allowed = lid in {f"Subnet{alnum(az)}" for az in empty_azs}
+        elif typ == "AWS::EC2::SubnetRouteTableAssociation":
+            allowed = lid in {f"Association{alnum(az)}" for az in empty_azs}
+        else:
+            allowed = False
         if not (rc["Action"] == "Remove" and rc["ResourceType"] in PRUNABLE
-                and rc.get("PhysicalResourceId") not in kept_physical and rc["LogicalResourceId"] not in kept_logical
-                and (rc["ResourceType"] != "AWS::EC2::LaunchTemplate" or rc["LogicalResourceId"] in removable_lts)):
+                and rc.get("PhysicalResourceId") not in kept_physical
+                and allowed):
             bad.append(f"{rc['Action']} {rc['ResourceType']} {rc['LogicalResourceId']}")
     return bad
 
 
 def unsafe_round_changes(changes, placement):
-    allowed = {"AWS::EC2::Instance"}
-    if placement == "cluster":
-        allowed.add("AWS::EC2::PlacementGroup")
+    allowed = {"AWS::EC2::Instance", "AWS::EC2::PlacementGroup"}
+    if placement == "partition":
+        allowed.add("AWS::EC2::LaunchTemplate")
     return [f"{rc['Action']} {rc['ResourceType']} {rc['LogicalResourceId']}"
             for ch in changes for rc in [ch["ResourceChange"]]
             if rc["Action"] != "Add" or rc["ResourceType"] not in allowed]
@@ -911,27 +969,17 @@ def prune(results):
                       "terminated": {k: c["instance_id"] for k, c in cands.items() if k not in keep}}, indent=2))
 
 
-def partition_number(index):
-    return index % PARTITIONS + 1
-
-
-def challenger_keys(az, start, count, occupied):
-    free = set(range(1, PARTITIONS + 1)) - occupied
-    keys = []
-    index = start
-    for _ in range(count):
-        while free and partition_number(index) not in free:
-            index += 1
-        keys.append(f"{az}-{index}")
-        free.discard(partition_number(index))
-        index += 1
-    return keys, index
+def partition_placement(index):
+    group, partition = divmod(index, PARTITIONS)
+    return group, partition + 1
 
 
 def next_round(run, per_az):
-    """Add per_az fresh challengers in every AZ the stack still has, next to the running winners (never touched)."""
+    """Add fresh challengers in every AZ the stack still has, next to the running winners (never touched)."""
     run = Path(run)
     cfg = load_cfg(run)
+    if cfg.get("placement", "cluster") == "partition" and per_az != PARTITIONS:
+        sys.exit(f"partition rounds require exactly {PARTITIONS} challengers per AZ (one fresh placement group)")
     stack = cfg["stack"]
     cands = candidates(stack)
     if not cands:
@@ -942,15 +990,17 @@ def next_round(run, per_az):
     cfg["new"] = []
     for az in cfg["az_subnets"]:
         if cfg.get("placement", "cluster") == "partition":
-            occupied = {partition_number(int(k.rsplit("-", 1)[1])) for k in cands if cands[k]["az_id"] == az}
-            keys, nxt[az] = challenger_keys(az, nxt[az], per_az, occupied)
-            cfg["new"] += keys
+            start = ((nxt[az] + PARTITIONS - 1) // PARTITIONS) * PARTITIONS
+            cfg["new"] += [f"{az}-{i}" for i in range(start, start + PARTITIONS)]
+            nxt[az] = start + PARTITIONS
         else:
             cfg["new"] += [f"{az}-{nxt[az] + i}" for i in range(per_az)]
             nxt[az] += per_az
     total = len(cfg["keep"]) + len(cfg["new"])
     if total > 33:
-        sys.exit(f"{total} candidates is over the ~33 the inline template can hold: use a smaller PER_AZ")
+        advice = ("keep 1 overall or split AZs into separate runs" if cfg.get("placement", "cluster") == "partition"
+                  else "use a smaller PER_AZ")
+        sys.exit(f"{total} candidates is over the ~33 the inline template can hold: {advice}")
     config = run / "config.json"
     original = config.read_text()
     config.write_text(json.dumps(cfg, indent=2) + "\n")
@@ -1034,6 +1084,9 @@ def selftest():
     configured_azs = {"az1", "az4", "az9"}
     assert not unsafe_changes([change("Remove", "AWS::EC2::Instance", "Instanceaz1a", "i-az1-a"),
                                change("Remove", "AWS::EC2::Subnet", "Subnetaz4", "s-az4")], keep, cands, configured_azs)
+    assert not unsafe_changes([change("Remove", "AWS::EC2::Instance", "Instanceaz12", "i-az1-2"),
+                               change("Remove", "AWS::EC2::PlacementGroup", "Cpgaz12", "g-az1-2")],
+                              keep, cands, configured_azs)
     assert unsafe_changes([change("Remove", "AWS::EC2::Instance", "Instanceaz1b", "i-az1-b")], keep, cands, configured_azs)  # winner
     assert unsafe_changes([change("Remove", "AWS::EC2::Subnet", "Subnetaz1", "s-az1")], keep, cands, configured_azs)  # winner's subnet
     assert unsafe_changes([change("Modify", "AWS::EC2::LaunchTemplate", "LaunchTemplate", "lt-1")], keep, cands, configured_azs)
@@ -1047,16 +1100,52 @@ def selftest():
     generic = {k: dict({field: value for field, value in c.items() if field != "cpg"},
                        placement_group=f"g-{c['az_id']}") for k, c in cands.items()}
     assert unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1", "g-az1")], keep, generic, configured_azs)
-    assert [partition_number(n) for n in (0, 1, 6, 7, 8, 13, 14)] == [1, 2, 7, 1, 2, 7, 1]
-    assert challenger_keys("az1", 7, 5, {1, 3, 6}) == (["az1-8", "az1-10", "az1-11", "az1-13", "az1-14"], 15)
-    assert challenger_keys("az1", 14, 2, {1, 2, 3, 4, 5, 6, 7}) == (["az1-14", "az1-15"], 16)
+    group_cands = {f"az1-{n}": {"az_id": "az1", "instance_id": f"i-{n}",
+                                "placement_group": f"g-az1-{n // 7}", "partition": n % 7 + 1,
+                                "subnet_id": "s-az1"} for n in (0, 7, 8)}
+    assert [partition_placement(n) for n in (0, 1, 6, 7, 8, 13, 14)] == [
+        (0, 1), (0, 2), (0, 7), (1, 1), (1, 2), (1, 7), (2, 1)]
+    assert not unsafe_changes([change("Remove", "AWS::EC2::Instance", "Instanceaz10", "i-0"),
+                               change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1", "g-az1-0"),
+                               *[change("Remove", "AWS::EC2::LaunchTemplate", f"LaunchTemplateaz1P{p}", f"lt-0-{p}")
+                                 for p in range(1, 8)]], ["az1-7"], group_cands, {"az1"})
+    assert unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1", "g-az1-0")],
+                          ["az1-0"], group_cands, {"az1"})
+    assert unsafe_changes([change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1P1", "lt-0-1")],
+                          ["az1-0"], group_cands, {"az1"})
+    assert unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1G1", "g-az1-1")],
+                          ["az1-7"], group_cands, {"az1"})
+    assert unsafe_changes([change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1G1P1", "lt-1-1")],
+                          ["az1-7"], group_cands, {"az1"})
+    assert not unsafe_changes([change("Remove", "AWS::EC2::Instance", "Instanceaz17", "i-7"),
+                               change("Remove", "AWS::EC2::Instance", "Instanceaz18", "i-8"),
+                               change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1G1", "g-az1-1"),
+                               *[change("Remove", "AWS::EC2::LaunchTemplate", f"LaunchTemplateaz1G1P{p}", f"lt-1-{p}")
+                                 for p in range(1, 8)]], ["az1-0"], group_cands, {"az1"})
+    assert not unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1G2", "g-az1-2"),
+                               change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1G2P1", "lt-2-1")],
+                              ["az1-0"], group_cands, {"az1"})
+    assert unsafe_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1", "g-az1-0"),
+                           change("Remove", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1P1", "lt-0-1")],
+                          ["az1-0"], group_cands, {"az1"})
     assert not unsafe_round_changes([change("Add", "AWS::EC2::Instance", "Instanceaz18", None)], "partition")
-    assert unsafe_round_changes([change("Add", "AWS::EC2::PlacementGroup", "Ppgaz1", None)], "partition")
-    assert unsafe_round_changes([change("Add", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1P1", None)], "partition")
+    assert not unsafe_round_changes([change("Add", "AWS::EC2::Instance", "Instanceaz17", None),
+                                     change("Add", "AWS::EC2::PlacementGroup", "Ppgaz1G1", None),
+                                     change("Add", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1G1P1", None)], "partition")
+    assert unsafe_round_changes([change("Modify", "AWS::EC2::LaunchTemplate", "LaunchTemplateaz1P1", "lt-1")], "partition")
+    assert unsafe_round_changes([change("Remove", "AWS::EC2::PlacementGroup", "Ppgaz1", "g-1")], "partition")
     assert not unsafe_round_changes([change("Add", "AWS::EC2::PlacementGroup", "Cpgaz18", None)], "cluster")
     assert pg({"cpg": "group", "partition": 4}) == "group p4"
     assert pg({"cpg": "group", "partition": None}) == "group"
     assert pg({"placement_group": "group", "partition": 4}) == "group p4"
+    round_cands = {"az1-0": dict(group_cands["az1-0"], public_ip="1.1.1.1"),
+                   "az1-7": dict(group_cands["az1-7"], public_ip="1.1.1.2")}
+    round_rows = [{**round_cands[k], **row(k, "tcp", "x", latency)} for k, latency in
+                  (("az1-0", 900), ("az1-7", 500))]
+    text, keep = render(round_rows, round_cands, {"tiers": [{"targets": ["tcp"]}], "keep": 1})
+    ranking = text.split("## Ranking by goal")[1].split("## tcp")[0]
+    assert keep == ["az1-7"] and "g-az1-0 p1" in ranking and "g-az1-1 p1" in ranking
+    assert "| az1-0 |" in ranking and "| az1-7 |" in ranking
     sync = probe_sync_commands()
     assert f"test -x {BIN}" in sync[0]
     assert "pipefail" in sync[-1] and f"rm -f {BIN}" in sync[-1]
@@ -1064,19 +1153,50 @@ def selftest():
         tmp = Path(tmp)
         config = tmp / "config.json"
         original = json.dumps({"stack": "offline-hunt", "az_subnets": {"az1": "10.0.0.0/27"},
-                               "instances_per_az": 1, "placement": "partition", "keep": []})
+                               "instances_per_az": 1, "placement": "partition", "keep": [],
+                               "user_data": "pinned"})
         config.write_text(original)
+        template = tmp / "cdk.out" / "offline-hunt.template.json"
+        template.parent.mkdir()
+        template.write_bytes(b"x" * (TEMPLATE_LIMIT + 1))
+        with patch.dict(globals(), {"cdk": lambda *args: None}):
+            try:
+                synth(tmp)
+            except SystemExit as e:
+                assert "keep 1 overall or split AZs" in str(e) and "fewer candidates per AZ" not in str(e)
+            else:
+                assert False, "oversized partition template was accepted"
         test_cands = {"az1-0": {"az_id": "az1", "instance_id": "i-az1-0", "placement_group": "g-az1",
                                 "subnet_id": "s-az1"}}
         bad_change = change("Modify", "AWS::EC2::Instance", "Instanceaz10", "i-az1-0")
         fake_aws = lambda *args: {"Changes": [bad_change]} if args[1] == "describe-change-set" else {}
+        staged = []
+        def fake_synth(run):
+            staged.append(load_cfg(run))
+            return staged[-1], tmp / "template.json"
         with patch.dict(globals(), {"aws": fake_aws, "sh": lambda *args: "",
-                                    "synth": lambda run: (load_cfg(run), tmp / "template.json"),
+                                    "synth": fake_synth,
                                     "candidates": lambda stack: test_cands}):
             try:
-                next_round(tmp, 1)
+                next_round(tmp, 5)
+            except SystemExit as e:
+                assert "exactly 7" in str(e)
+            assert config.read_text() == original
+            oversized = {f"az1-{n}": dict(test_cands["az1-0"], instance_id=f"i-{n}") for n in range(27)}
+            with patch.dict(globals(), {"candidates": lambda stack: oversized}):
+                try:
+                    next_round(tmp, 7)
+                except SystemExit as e:
+                    assert "keep 1 overall or split AZs" in str(e) and "PER_AZ" not in str(e)
+                else:
+                    assert False, "oversized partition round was accepted"
+            assert config.read_text() == original
+            try:
+                next_round(tmp, 7)
             except SystemExit as e:
                 assert "refusing to extend" in str(e)
+            assert staged[-1]["new"] == [f"az1-{n}" for n in range(7, 14)]
+            assert staged[-1]["next_index"]["az1"] == 14
             assert config.read_text() == original
             results = tmp / "results" / "first"
             results.mkdir(parents=True)
@@ -1086,6 +1206,74 @@ def selftest():
             except SystemExit as e:
                 assert "refusing to prune" in str(e)
             assert config.read_text() == original
+        resources = [{"ResourceType": "AWS::EC2::PlacementGroup", "PhysicalResourceId": "g-old",
+                      "LogicalResourceId": "Ppgaz1"},
+                     {"ResourceType": "AWS::EC2::PlacementGroup", "PhysicalResourceId": "g-new",
+                      "LogicalResourceId": "Ppgaz1G1"}]
+        deletes = []
+        def fake_destroy_aws(*args):
+            if args[1] == "describe-stack-resources":
+                return {"StackResources": resources}
+            if args[1] == "delete-stack":
+                deletes.append(args)
+            return {}
+        def fake_wait(*args):
+            if len(deletes) == 1:
+                raise subprocess.CalledProcessError(1, args)
+        with patch.dict(globals(), {
+            "aws": fake_destroy_aws, "sh": fake_wait, "log": lambda msg: None,
+            "print": lambda *args, **kwargs: None,
+            "foreign_instances": lambda stack, name, values: (
+                [{"Placement": {"GroupName": "g-new"}}] if name == "placement-group-name" and "g-new" in values else []),
+        }):
+            try:
+                destroy(tmp)
+            except SystemExit as e:
+                assert "--retain" in str(e)
+            assert not deletes
+            destroy(tmp, True)
+        assert len(deletes) == 2 and "--retain-resources" not in deletes[0]
+        assert deletes[1][-2:] == ("--retain-resources", "Ppgaz1G1")
+    with tempfile.TemporaryDirectory() as tmp:
+        azs = ["use1-az1", "use1-az2", "use1-az3"]
+        def preflight_aws(*args):
+            name = args[1]
+            if name == "describe-vpcs":
+                return {"Vpcs": [{"CidrBlockAssociationSet": [
+                    {"CidrBlock": "10.0.0.0/16", "CidrBlockState": {"State": "associated"}}]}]}
+            if name == "describe-vpc-attribute":
+                return {"EnableDnsSupport": {"Value": True}}
+            if name == "describe-internet-gateways":
+                return {"InternetGateways": [{"InternetGatewayId": "igw-test"}]}
+            if name == "describe-route-tables":
+                return {"RouteTables": []}
+            if name == "describe-network-acls":
+                return {"NetworkAcls": [{"Entries": [
+                    {"Egress": e, "RuleNumber": 100, "RuleAction": "allow", "Protocol": "-1",
+                     "CidrBlock": "0.0.0.0/0"} for e in (False, True)]}]}
+            if name == "describe-subnets":
+                return {"Subnets": [{"CidrBlock": "10.0.0.0/27", "SubnetId": "subnet-test"}]}
+            if name == "describe-instance-types":
+                return {"InstanceTypes": [{"VCpuInfo": {"DefaultVCpus": 2},
+                                            "ProcessorInfo": {"SupportedArchitectures": ["arm64"]}}]}
+            if name == "describe-instance-type-offerings":
+                return {"InstanceTypeOfferings": [{"Location": az} for az in azs]}
+            if name == "get-service-quota":
+                return {"Quota": {"Value": 1000}}
+            if name == "describe-images":
+                return {"Images": [{"Architecture": "arm64", "State": "available", "Name": "al2023"}]}
+            raise AssertionError(name)
+        printed = []
+        with patch.dict(globals(), {"RUNS": Path(tmp), "aws": preflight_aws, "sh": lambda *args: "",
+                                    "on_demand_price": lambda *args: 1.0,
+                                    "standard_vcpus_in_use": lambda: 0,
+                                    "template_size_and_max": lambda cfg: (42993, 24409, None),
+                                    "offline_template_size": lambda cfg: 69681,
+                                    "print": lambda *args, **kwargs: printed.append(" ".join(map(str, args)))}):
+            with patch.dict(os.environ, {"AWS_REGION": "us-east-1"}):
+                assert preflight("vpc-test", "m8azn.large", 7, azs, 300, {}, "ami-test") == 0
+        assert any(line.startswith("WARN") and "keep 1 overall or split AZs" in line for line in printed), printed
+        assert not any(line.startswith("FAIL") for line in printed), printed
     python = VENV / "bin" / "python"
     env = {**os.environ, "JSII_RUNTIME_PACKAGE_CACHE": "disabled"}
     if not python.exists() or subprocess.run([str(python), "-c", "import aws_cdk"], env=env,
@@ -1099,11 +1287,19 @@ def selftest():
                    "instance_type": "m8azn.large", "instances_per_az": 7, "ami": "ami-12345678",
                    "extra_routes": {}, "keep": [], "placement": "partition"}
             config = tmp / "config.json"
-            for mode in ("partition", "partition-3az", "partition-4az", "legacy-cluster"):
+            for mode in ("partition", "partition-round", "partition-pruned-group1",
+                         "partition-3az", "partition-4az", "legacy-cluster"):
                 cfg.pop("user_data", None)
+                cfg["keep"] = []
+                cfg.pop("new", None)
                 cfg["az_subnets"] = {f"use1-az{n}": f"10.0.{n - 1}.0/27"
                                      for n in range(1, 1 + (3 if mode == "partition-3az" else 4 if mode == "partition-4az" else 1))}
                 cfg["instances_per_az"] = 6 if mode == "partition-4az" else 7
+                if mode == "partition-round":
+                    cfg["keep"] = ["use1-az1-0"]
+                    cfg["new"] = [f"use1-az1-{n}" for n in range(7, 14)]
+                elif mode == "partition-pruned-group1":
+                    cfg["keep"] = ["use1-az1-7"]
                 if mode == "legacy-cluster":
                     cfg.pop("placement")
                 config.write_text(json.dumps(cfg))
@@ -1116,11 +1312,13 @@ def selftest():
                 template = out / "offline-hunt.template.json"
                 if mode == "partition-4az":
                     assert template.stat().st_size > TEMPLATE_LIMIT
-                    assert template_size_and_max(cfg)[1] == 5
+                    assert template_size_and_max(cfg)[2] == 5
                 else:
                     assert template.stat().st_size < TEMPLATE_LIMIT
                 if mode == "partition-3az":
-                    assert template_size_and_max(cfg)[0] < TEMPLATE_LIMIT
+                    initial_size, round_size, maximum = template_size_and_max(cfg)
+                    assert initial_size < TEMPLATE_LIMIT and round_size < TEMPLATE_LIMIT and maximum is None
+                    assert list(round_template_cfg(cfg)["az_subnets"]) == ["use1-az1"]
                 resources = json.loads(template.read_text())["Resources"]
                 lts = [r for r in resources.values() if r["Type"] == "AWS::EC2::LaunchTemplate"]
                 if mode == "partition":
@@ -1137,6 +1335,17 @@ def selftest():
                     assert result.returncode == 0, result.stderr
                     repeated = json.loads(template.read_text())["Resources"]
                     assert original_lts == {k: v for k, v in repeated.items() if v["Type"] == "AWS::EC2::LaunchTemplate"}
+                    group0 = {k: v for k, v in resources.items() if k == "Ppguse1az1" or k.startswith("LaunchTemplateuse1az1P")}
+                    assert len(group0) == 8
+                elif mode == "partition-round":
+                    assert sum(r["Type"] == "AWS::EC2::PlacementGroup" for r in resources.values()) == 2
+                    assert len(lts) == 14
+                    assert {k: resources[k] for k in group0} == group0
+                    assert all(resources[f"Instanceuse1az1{n}"]["Properties"]["LaunchTemplate"]["LaunchTemplateId"] ==
+                               {"Ref": f"LaunchTemplateuse1az1G1P{n - 6}"} for n in range(7, 14))
+                elif mode == "partition-pruned-group1":
+                    assert "Ppguse1az1" not in resources and "Ppguse1az1G1" in resources
+                    assert len(lts) == 7
                 elif mode == "legacy-cluster":
                     assert len(lts) == 1
                     assert sum(r["Type"] == "AWS::EC2::PlacementGroup" for r in resources.values()) == 7
@@ -1153,7 +1362,7 @@ if __name__ == "__main__":
     s.add_argument("--ami", help="AMI id or SSM public parameter path (default: latest Amazon Linux 2023)")
     s.add_argument("--route", action="append", default=[], help="CIDR=pcx-xxx or CIDR=tgw-xxx")
     s.add_argument("--placement", choices=["partition", "cluster"], default="partition",
-                   help="partition: 7 partitions per AZ in one partition placement group (default); "
+                   help="partition: 7 partitions per group, a fresh group each round (default); "
                         "cluster: one cluster placement group per candidate")
     sub.add_parser("deploy").add_argument("run")
     s = sub.add_parser("run")
@@ -1162,7 +1371,8 @@ if __name__ == "__main__":
     s = sub.add_parser("report")
     s.add_argument("results"), s.add_argument("--goal"), s.add_argument("--keep", type=int, help="override goal keep")
     s = sub.add_parser("round")
-    s.add_argument("run"), s.add_argument("per_az", type=int)
+    s.add_argument("run"), s.add_argument("per_az", type=int,
+                                          help="partition: exactly 7 per AZ; cluster: count per AZ")
     sub.add_parser("prune").add_argument("results")
     s = sub.add_parser("destroy")
     s.add_argument("run"), s.add_argument("--retain", action="store_true", help="keep placement groups used by non-hunt instances")

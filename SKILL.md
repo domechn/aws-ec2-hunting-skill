@@ -8,9 +8,9 @@ description: One-click EC2 hunting for low-latency crypto trading. Launches test
 Two instances of the same type in the same AZ can have different latency to an exchange, because latency belongs
 to the physical placement (host, rack, network path). Hunting = launch many, measure, keep the fastest.
 
-The default is **partition placement**: one partition placement group (PPG) per AZ, with 7 partitions whose rack sets
-never overlap. At 7 candidates per AZ, every candidate tests a distinct rack set. Candidate index `i` uses partition
-`i % 7 + 1`; more than 7 candidates per AZ share partitions. The winning **instance itself** is the deliverable:
+The default is **partition placement**: a partition placement group (PPG) has 7 partitions whose rack sets
+never overlap. Candidate index `i` uses group `i // 7` and partition `i % 7 + 1`. Every further round creates
+a fresh PPG per AZ and tests its 7 new candidates together with the incumbent from an older PPG. The winning **instance itself** is the deliverable:
 keep it running and reboot only, because stop/start can move it to another host. Another instance in the same
 partition is not promised the same latency; re-measure it. `--placement cluster` instead gives every candidate its own
 CPG; in that mode production instances can later join the winning CPG in the same network segment.
@@ -61,10 +61,10 @@ Requirements differ a lot between users, so ask until all of this is clear. Neve
   Binance the market-data leg" = fastest OKX first, then among candidates within 5% of it, the fastest Binance.
 - **Hard limits** (optional), e.g. "OKX p50 must be under 800 us". Candidates over the limit are terminated even if they rank first.
 - **Metric**: p50 by default; p99 if they care about the tail.
-- **Rounds**: default 1 round. For a more reliable pick, run several elimination rounds (e.g. 3): every round adds fresh
-  challengers next to the previous winners (step 12), tests them all in the same time window, and keeps the top N. Ask how many
-  challengers per AZ each round adds and how many survive each round (e.g. keep 3 / 2 / 1); the survivors of the last round
-  are the final winners. One round = one `keep` value, passed as `report --keep N`.
+- **Rounds**: default 1 round. For a more reliable pick, run several elimination rounds (e.g. 3).
+  In partition mode, each further round adds 7 fresh candidates per surviving AZ in a new PPG, tests them with the
+  incumbent in the same time window, then `report --keep 1` and `prune` leave one fastest instance. Ask how many
+  rounds to run. In cluster mode, ask how many challengers per AZ each round adds and how many survive each round.
 
 Write `runs/goal.json` (step 11 passes it to the report) and read it back to the user in plain words:
 
@@ -116,10 +116,12 @@ in one tier are averaged as ratios to their best. `max_us` is a hard limit; `met
   never share a core; offered in all Tokyo AZs). In cluster mode, ask which type production will use and prefer the same
   family: mixing types in a CPG raises the odds of capacity errors when production joins it later. T family is rejected
   in cluster mode (no CPG support).
-- **Candidates per AZ**: default 7, the sweet spot for testing distinct partitions. Above 7, candidates share partitions
-  (`i % 7 + 1`). In partition mode, the inline CloudFormation template fits about 10 per AZ across 3 AZs, or 5 per AZ
-  across 4 AZs; 5 or more AZs have little room. Preflight checks the actual template and reports the maximum per AZ that
-  fits. Split larger hunts into separate runs.
+- **Candidates per AZ**: default 7, one per partition in the initial PPG. Above 7, candidate index `i`
+  uses PPG `i // 7` and partition `i % 7 + 1`. In partition mode, preflight sizes both the initial template and
+  the next round after `--keep 1` overall (one old PPG and one new PPG in the winner's AZ). With the current inline
+  51,200-byte limit, 3 AZs × 7 initial candidates fit, while 4 AZs × 6 need a maximum of 5 per AZ. If keeping a
+  winner in every AZ would make the next round too large, preflight warns to keep 1 overall or split AZs into
+  separate runs. In cluster mode, preflight checks the initial template size.
 - **Duration**: default 300 s, never less than 300 (`hunt.py` refuses).
 - **AMI**: ask with AskUserQuestion, options: "default: latest Amazon Linux 2023 (Recommended)" (SSM agent built in, chrony on
   Amazon Time Sync) or their own, entered as Other: an AMI id (`ami-...`, must be visible in the region and match the
@@ -149,7 +151,8 @@ One AskUserQuestion (options: start / change parameters / cancel) whose text cov
 
 - What gets created in which VPC: N x `<type>`, one /27 subnet per AZ, a route table, a security group
   (egress only), an IAM role + instance profile (SSM only), and an IGW only if the VPC has none. Partition mode adds
-  one PPG and 7 launch templates per AZ; cluster mode adds one CPG per candidate and one launch template.
+  one PPG and 7 launch templates per AZ initially; each further partition round adds a new PPG and 7 launch
+  templates per surviving AZ. Cluster mode adds one CPG per candidate and one launch template.
   Nothing existing is modified.
 - Cost: `estimated_run_usd` from preflight (instances + public IPv4, about `hours` hours), or "see On-Demand pricing" if the lookup failed.
 - Timeline: about 5-8 min deploy + build, 1 min smoke, then the test duration, then the report.
@@ -189,7 +192,8 @@ then starts all probes together so they share the same time window. The last std
 
 ### 11. Report
 
-`$HUNT report <results-dir> --goal runs/goal.json [--keep N]`. It writes `report.md` and `keep.json` there. Show the user the
+`$HUNT report <results-dir> --goal runs/goal.json --keep 1` in partition mode (cluster mode may use `--keep N`).
+It writes `report.md` and `keep.json` there. Show the user the
 "Ranking by goal" table, the per-target tables (each instance's **fastest endpoint IP** with TCP handshake RTT / TLS / WS upgrade / req/resp RTT),
 the market-data lag table, the per-AZ line and the recommendation, which lists every endpoint IP of each winner, fastest first.
 The report also has a "Test environment and method" section (collected automatically on every run: OS, kernel, NIC driver,
@@ -205,18 +209,21 @@ Then add 2-4 observations, e.g.:
 ### 12. Recycle the losers (automatic, already confirmed in step 7)
 
 `$HUNT prune <results-dir>`. It rebuilds the stack with only the kept candidates and creates a CloudFormation change set.
-It executes the change set only if every change removes a losing instance or its CPG (cluster mode), or the PPG,
-7 launch templates, and subnet of an AZ with no winner left (partition mode). The shared PPG and launch templates
-stay while that AZ has a winner. Any other change aborts with the offending changes listed. With nothing kept it deletes
+It executes the change set only if every change removes a losing instance or its CPG (cluster mode), or a PPG
+and its 7 launch templates when that group has no kept instance (partition mode). A subnet and its route table
+association can be removed only when its AZ has no winner. A kept instance's PPG and launch templates stay.
+Any other change aborts with the offending changes listed. With nothing kept it deletes
 the whole stack. Report what was kept, what was terminated, and the ongoing hourly cost.
 
 ### 12b. More rounds (when the user asked for them)
 
-Each further round: `$HUNT round runs/<stack> <challengers-per-az>` adds fresh candidates in the AZs that still have a winner
-(CloudFormation change set; partition mode allows only added instances, cluster mode also allows added CPGs, so the winners
-are never touched). Partition challengers use partitions without a winner first. Then repeat
-steps 10-12 with `report --keep <survivors this round>`. Tell the user the round number and who survived after each one.
-The last round's survivors are the final winners; show how they ranked in every round (the earlier `results/` dirs).
+In partition mode, `$HUNT round runs/<stack> 7` adds one fresh PPG, 7 launch templates, and 7 candidates
+per AZ with an incumbent. The change set may only add instances, PPGs, and launch templates; existing resources
+cannot be modified or replaced. Run step 10 against the incumbent and all challengers together, then
+`report <results-dir> --goal runs/goal.json --keep 1` and `prune <results-dir>` to keep only the fastest instance.
+Repeat for each requested round. In cluster mode, `$HUNT round runs/<stack> <challengers-per-az>` retains its
+configurable count and survivor flow. Tell the user the round number and who survived; show how the final winner
+ranked in every round (the earlier `results/` dirs).
 
 ### 13. Hand-off
 

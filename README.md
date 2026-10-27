@@ -2,8 +2,9 @@
 
 A Claude Code skill that hunts for the EC2 placement with the lowest WebSocket latency to crypto exchanges.
 
-By default it launches test instances in one partition placement group per AZ, with 7 partitions whose rack sets never
-overlap. Seven candidates per AZ therefore test distinct rack sets. It then measures TCP handshake and WebSocket
+By default it launches test instances across 7 partitions in a partition placement group per AZ. Each partition has
+distinct rack sets. Every further round creates a new placement group with 7 fresh rack sets per AZ. It then measures
+TCP handshake and WebSocket
 request/response RTT from every instance to every IP of every exchange endpoint at the same time, for at least
 5 minutes, and ranks the instances against your goal (for example "OKX order leg first, Binance market data second").
 At the end it keeps the winning **instance** and terminates the rest. Keep that instance running; `sudo reboot` is fine,
@@ -50,15 +51,23 @@ $HUNT preflight vpc-xxxx m8azn.large 7 apne1-az1 apne1-az4      # partition is t
 $HUNT deploy runs/<stack>
 $HUNT run runs/<stack> runs/targets.json 30 --smoke
 $HUNT run runs/<stack> runs/targets.json 600                   # prints the results directory
-$HUNT report <results-dir> --goal runs/goal.json [--keep N]    # goal format: see SKILL.md step 3
+$HUNT report <results-dir> --goal runs/goal.json --keep 1       # partition: keep the fastest; goal format in SKILL.md
 $HUNT prune <results-dir>                                      # keep the winners, terminate the rest
-$HUNT round runs/<stack> 5                                     # next round: 5 fresh challengers per AZ next to the winners
+$HUNT round runs/<stack> 7                                     # partition: 7 fresh challengers per AZ in a new group
+$HUNT run runs/<stack> runs/targets.json 600                   # test incumbents and challengers together
+$HUNT report <new-results-dir> --goal runs/goal.json --keep 1
+$HUNT prune <new-results-dir>                                  # keep the fastest instance and its group
 $HUNT destroy runs/<stack> [--retain]                          # when done
 $HUNT selftest                                                 # ranking and prune-safety checks
 ```
 
-Seven candidates per AZ is the partition-mode sweet spot. With more than 7, candidates share partitions:
-candidate index `i` uses partition `i % 7 + 1`. The probe source is synced over SSM and built by `hunt.py run`;
+In partition mode, candidate index `i` uses group `i // 7` and partition `i % 7 + 1`. Every `round` adds exactly
+7 candidates per surviving AZ, one per partition in a new group; it also tests the incumbent from its older group.
+The inline CloudFormation template must hold both groups, so preflight checks the next round after `--keep 1`
+overall (about 8 KB per group in the winner's AZ). With the current template, 3 AZs × 7 initial candidates fit;
+a 4 AZ × 6 run exceeds the 51,200-byte limit and preflight reports a maximum of 5 per AZ. Keeping a winner in
+every AZ can make the next round too large; preflight warns to keep 1 overall or split AZs into separate runs. Cluster mode keeps the
+`round` count as a per-AZ choice. The probe source is synced over SSM and built by `hunt.py run`;
 partition-mode user data only bootstraps the toolchain.
 
 ## How it measures
